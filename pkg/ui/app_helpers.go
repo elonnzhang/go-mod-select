@@ -14,11 +14,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// addAnalysisLog adds a log entry for the analysis screen (no limit, all logs kept)
-func (m *AppModel) addAnalysisLog(msg string) {
-	m.analysisLogs = append(m.analysisLogs, msg)
-}
-
 // updateOrAddAnalysisLog updates an existing log entry or adds a new one
 // This is used to replace [CHECKING] status with final status (FOUND/SKIPPED/ERROR)
 func (m *AppModel) updateOrAddAnalysisLog(msg string) {
@@ -144,11 +139,11 @@ func (m *AppModel) syncViewportToCursor() {
 	viewportBottom := viewportTop + m.viewport.Height - 1
 
 	if cursorLine > viewportBottom {
-		m.viewport.LineDown(cursorLine - viewportBottom)
+		m.viewport.ScrollDown(cursorLine - viewportBottom)
 	}
 
 	if cursorLine < viewportTop {
-		m.viewport.LineUp(viewportTop - cursorLine)
+		m.viewport.ScrollUp(viewportTop - cursorLine)
 	}
 }
 
@@ -555,8 +550,8 @@ func (m AppModel) getAnalyzingLogVisibleLines() int {
 	return logContentHeight
 }
 
-// RunFullTUI runs the complete TUI application
-func RunFullTUI(targetGoVersion string, goMod *parser.GoMod, projectRoot string) ([]*finder.ModuleInfo, error) {
+// TUI runs the complete TUI application
+func TUI(targetGoVersion string, goMod *parser.GoMod, projectRoot string) ([]*finder.ModuleInfo, error) {
 	m := InitialAppModel(targetGoVersion, goMod, projectRoot)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 

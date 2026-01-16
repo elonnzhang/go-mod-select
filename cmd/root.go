@@ -47,6 +47,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&autoSelect, "auto", false, "Automatically select all compatible updates")
 }
 
+// Execute enters the main execution flow of the CLI tool.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

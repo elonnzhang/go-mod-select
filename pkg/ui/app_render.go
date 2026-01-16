@@ -48,6 +48,7 @@ func (m AppModel) renderWelcome() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, b.String())
 }
 
+// renderGoModInfo renders the current go.mod information in welcome screen
 func (m AppModel) renderGoModInfo() string {
 	var b strings.Builder
 
@@ -56,8 +57,8 @@ func (m AppModel) renderGoModInfo() string {
 	b.WriteString(fmt.Sprintf("Module:           %s\n", m.goMod.Module))
 	b.WriteString(fmt.Sprintf("Current Go:       %s\n", m.goMod.GoVersion))
 	b.WriteString(fmt.Sprintf("Target Go:        %s\n", m.targetGoVersion))
-	b.WriteString(fmt.Sprintf("Direct deps:      %d\n", countDirectDeps(m.goMod.Requires)))
-	b.WriteString(fmt.Sprintf("Indirect deps:    %d\n", countIndirectDeps(m.goMod.Requires)))
+	b.WriteString(fmt.Sprintf("Direct deps:      %d\n", parser.CountDirectDeps(m.goMod.Requires)))
+	b.WriteString(fmt.Sprintf("Indirect deps:    %d\n", parser.CountIndirectDeps(m.goMod.Requires)))
 
 	return b.String()
 }
@@ -109,6 +110,7 @@ func (m AppModel) renderAnalyzing() string {
 	return lipgloss.JoinVertical(lipgloss.Left, topSectionRendered, logSection)
 }
 
+//
 func (m AppModel) renderSelection() string {
 	if !m.ready {
 		return "Initializing..."
@@ -795,24 +797,4 @@ func (m AppModel) formatAnalysisLogLine(logLine string) string {
 
 	// Fallback for any unrecognized format
 	return "  " + m.logStyle().Render(logLine)
-}
-
-func countDirectDeps(requires []parser.Require) int {
-	count := 0
-	for _, req := range requires {
-		if !req.Indirect {
-			count++
-		}
-	}
-	return count
-}
-
-func countIndirectDeps(requires []parser.Require) int {
-	count := 0
-	for _, req := range requires {
-		if req.Indirect {
-			count++
-		}
-	}
-	return count
 }

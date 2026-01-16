@@ -40,7 +40,7 @@ func Run(cfg *Config) error {
 	}
 
 	// Run full TUI mode
-	selectedModules, err := ui.RunFullTUI(cfg.TargetGoVersion, goMod, projectRoot)
+	selectedModules, err := ui.TUI(cfg.TargetGoVersion, goMod, projectRoot)
 	if err != nil {
 		return fmt.Errorf("TUI failed: %w", err)
 	}

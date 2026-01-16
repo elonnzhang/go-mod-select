@@ -44,7 +44,8 @@ type SelectableModule struct {
 	Updated  bool // Whether this module has been updated
 }
 
-// Model for the full TUI application
+// AppModel for the full TUI application
+// implement tea.Model interface
 type AppModel struct {
 	// App state
 	currentScreen   screen
@@ -70,16 +71,16 @@ type AppModel struct {
 	detailViewport  viewport.Model // Viewport for scrollable detail popup
 
 	// Progress state
-	spinner          spinner.Model
-	progress         progress.Model
-	analyzingStatus  string
-	analyzingPackage string // Current package being analyzed
-	analyzingCount   int    // Number of packages analyzed
-	analyzingTotal   int    // Total packages to analyze
-	analyzingLogOffset int  // Scroll offset for analysis logs
-	updatingStatus   string
-	currentModule    int
-	totalModules     int
+	spinner            spinner.Model
+	progress           progress.Model
+	analyzingStatus    string
+	analyzingPackage   string // Current package being analyzed
+	analyzingCount     int    // Number of packages analyzed
+	analyzingTotal     int    // Total packages to analyze
+	analyzingLogOffset int    // Scroll offset for analysis logs
+	updatingStatus     string
+	currentModule      int
+	totalModules       int
 
 	// Update subscription
 	updateSub chan tea.Msg // Channel for receiving update progress
@@ -114,60 +115,6 @@ type AnalyzedPackage struct {
 	Status string // "found", "skipped", "error"
 }
 
-type keyMap struct {
-	Up       key.Binding
-	Down     key.Binding
-	Space    key.Binding
-	Enter    key.Binding
-	Tab      key.Binding
-	Filter   key.Binding
-	Esc      key.Binding
-	Quit     key.Binding
-	PageUp   key.Binding
-	PageDown key.Binding
-}
-
-var keys = keyMap{
-	Up: key.NewBinding(
-		key.WithKeys("up", "k"),
-		key.WithHelp("↑/k", "up"),
-	),
-	Down: key.NewBinding(
-		key.WithKeys("down", "j"),
-		key.WithHelp("↓/j", "down"),
-	),
-	Space: key.NewBinding(
-		key.WithKeys(" "),
-		key.WithHelp("space", "toggle"),
-	),
-	Enter: key.NewBinding(
-		key.WithKeys("enter"),
-		key.WithHelp("enter", "confirm"),
-	),
-	Tab: key.NewBinding(
-		key.WithKeys("tab"),
-		key.WithHelp("tab", "switch tab"),
-	),
-	Filter: key.NewBinding(
-		key.WithKeys("/"),
-		key.WithHelp("/", "filter"),
-	),
-	Esc: key.NewBinding(
-		key.WithKeys("esc"),
-		key.WithHelp("esc", "cancel"),
-	),
-	Quit: key.NewBinding(
-		key.WithKeys("ctrl+c", "q"),
-		key.WithHelp("q/ctrl+c", "quit"),
-	),
-	PageUp: key.NewBinding(
-		key.WithKeys("pgup"),
-	),
-	PageDown: key.NewBinding(
-		key.WithKeys("pgdown"),
-	),
-}
-
 // Messages
 type analyzeCompleteMsg struct {
 	requireModules    []*finder.ModuleInfo
@@ -198,6 +145,7 @@ type startUpdateMsg struct {
 	goMod           *parser.GoMod
 }
 
+// InitialAppModel creates a new AppModel with default values
 func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot string) AppModel {
 	// Load color configuration
 	colors, err := config.LoadOrCreateDefault()
@@ -233,10 +181,12 @@ func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot st
 	}
 }
 
+// Implement the tea.Model interface
 func (m AppModel) Init() tea.Cmd {
 	return m.spinner.Tick
 }
 
+// Implement the tea.Model interface
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -379,6 +329,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleKeyPress Handle key presses
 func (m AppModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Global quit
 	if key.Matches(msg, keys.Quit) {
@@ -391,7 +342,7 @@ func (m AppModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if key.Matches(msg, keys.Enter) {
 			m.currentScreen = screenAnalyzing
 			// Initialize analysis counters
-			m.analyzingTotal = countDirectDeps(m.goMod.Requires)
+			m.analyzingTotal = parser.CountDirectDeps(m.goMod.Requires)
 			m.analyzingCount = 0
 			m.analyzingPackage = ""
 			m.analyzingLogOffset = 0 // Reset scroll offset
@@ -628,6 +579,7 @@ func (m AppModel) handleFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// View renders the UI. implements tea.Model
 func (m AppModel) View() string {
 	if m.width == 0 {
 		return "Loading..."
@@ -726,5 +678,3 @@ func (m AppModel) getVersionStyle(updateType finder.UpdateType) lipgloss.Style {
 		return lipgloss.NewStyle()
 	}
 }
-
-// Implement remaining methods in next file...

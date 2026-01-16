@@ -15,20 +15,20 @@ import (
 type UpdateType int
 
 const (
-	Patch UpdateType = iota
+	Major UpdateType = iota
 	Minor
-	Major
+	Patch
 	Prerelease
 )
 
 func (ut UpdateType) String() string {
 	switch ut {
-	case Patch:
-		return "patch"
-	case Minor:
-		return "minor"
 	case Major:
 		return "major"
+	case Minor:
+		return "minor"
+	case Patch:
+		return "patch"
 	case Prerelease:
 		return "prerelease"
 	default:
@@ -145,6 +145,7 @@ func FindCompatibleVersions(modulePath, currentVersion, targetGoVersion string) 
 
 	// Filter compatible versions
 	var compatible []string
+	// reverse order to find latest compatible version first
 	for i := len(allVersions) - 1; i >= 0; i-- {
 		ver := allVersions[i]
 		// Get module info to check GoVersion requirement

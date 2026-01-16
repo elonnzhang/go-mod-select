@@ -24,7 +24,7 @@ type Require struct {
 	Indirect bool
 }
 
-// A Replace is a single replace statement.
+// Replace is a single replace statement.
 type Replace struct {
 	OldPath    string
 	OldVersion string
@@ -167,4 +167,24 @@ func (gm *GoMod) Backup() []byte {
 // Restore restores the go.mod file from backup
 func (gm *GoMod) Restore(backup []byte) error {
 	return os.WriteFile(gm.FilePath, backup, 0o644)
+}
+
+func CountDirectDeps(requires []Require) int {
+	count := 0
+	for _, req := range requires {
+		if !req.Indirect {
+			count++
+		}
+	}
+	return count
+}
+
+func CountIndirectDeps(requires []Require) int {
+	count := 0
+	for _, req := range requires {
+		if req.Indirect {
+			count++
+		}
+	}
+	return count
 }
