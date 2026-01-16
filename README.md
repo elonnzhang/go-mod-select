@@ -4,6 +4,13 @@
 
 灵感来自 [go-mod-upgrade](https://github.com/oligot/go-mod-upgrade)
 
+<img src="./img/welcome.png">
+
+|                                       |                                       |
+| ------------------------------------- | ------------------------------------- |
+| <img src="./img/analyze.png">         | <img src="./img/update_mod.png">      |
+| <img src="./img/required_detail.png"> | <img src="./img/indirect_detail.png"> |
+
 ## ✨ 特性
 
 - 🎯 **智能兼容性检查** - 自动检测依赖与目标 Go 版本的兼容性
@@ -68,6 +75,7 @@ go-mod-select 1.25 --verbose
 | `q` 或 `Ctrl+C`        | 退出                                               |
 
 ## 🎨 颜色说明
+
 - 🔵 **青色** - Major 更新（主版本）
 - 🟡 **黄色** - Minor 更新（次版本）
 - 🟢 **绿色** - Patch 更新（补丁版本）
