@@ -1,0 +1,19 @@
+{
+  "title": "#ff5faf",
+  "header": "#5f87af",
+  "border": "#5f87af",
+  "tab_active": "#ff5faf",
+  "tab_inactive": "#626262",
+  "tab_background": "#303030",
+  "help": "#626262",
+  "patch": "#00d700",
+  "minor": "#ffd700",
+  "major": "#00afff",
+  "prerelease": "#ff0000",
+  "selected": "#ff5faf",
+  "cursor": "#ff87d7",
+  "popup_border": "#ff5faf",
+  "info": "#5fffd7",
+  "success": "#00d700",
+  "log": "#949494"
+}
