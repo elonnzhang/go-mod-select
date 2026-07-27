@@ -4,19 +4,27 @@
 
 ```
 go-mod-select/
-├── cmd/                    # 命令行入口
-│   └── root.go            # Cobra 命令定义
-├── pkg/                   # 核心包
-│   ├── parser/            # go.mod 解析
-│   ├── finder/            # 版本查询和兼容性检查
-│   ├── ui/                # TUI 界面
-│   ├── updater/           # 模块更新执行
-│   ├── controller/        # 主流程控制
-│   ├── analyzer/          # 依赖分析
-│   ├── logger/            # 日志管理
-│   └── config/            # 配置管理
-├── docs/                  # 文档
-└── main.go               # 程序入口
+├── cmd/
+│   ├── root.go              # Cobra 命令定义、参数校验、go.mod 路径解析
+│   └── root_test.go
+├── pkg/
+│   ├── parser/              # go.mod 解析与写回
+│   ├── finder/
+│   │   ├── finder.go        # 版本查询（沙箱 + 批量 + 命中即停）
+│   │   └── version.go       # Go 版本比较（go/version）
+│   ├── ui/
+│   │   ├── app_model.go     # Bubbletea 模型、消息、按键分发
+│   │   ├── app_render.go    # 各屏幕渲染
+│   │   ├── app_helpers.go   # 分析 worker、详情加载、派生状态
+│   │   ├── app_keys.go      # 按键绑定表
+│   │   └── banner.txt       # 嵌入的 ASCII banner
+│   ├── updater/             # go get / go mod tidy / 回滚 / 版本校验
+│   ├── controller/          # 模式分派（dry-run / auto / TUI）
+│   ├── analyzer/            # AST 导入扫描、go mod why
+│   ├── logger/              # slog JSON 日志
+│   └── config/              # 颜色配置
+├── docs/
+└── main.go
 ```
 
 ## 模块说明
@@ -24,27 +32,30 @@ go-mod-select/
 ### 1. CLI Layer (`cmd/`)
 
 **职责**：
-- 命令行参数解析
-- 参数验证
-- 日志初始化
-- 调用控制器
+- 命令行参数解析与互斥校验
+- 目标版本格式校验（复用 finder 的解析逻辑，避免 CLI 接受的与实际能比较的漂移）
+- go.mod 路径解析：`--gomod` > `--dir` > 向上查找模块根
+- 日志初始化（失败只警告，不中止）
 
 **主要文件**：
-- `root.go` - Cobra 命令定义，参数处理
+- `root.go` - Cobra 命令定义，`resolveGoModPath` / `findModuleRoot`
 
 ### 2. Parser Module (`pkg/parser/`)
 
 **职责**：
-- 解析 go.mod 文件
-- 提取模块信息（require, replace, go version）
-- 更新 go.mod 文件
-- 备份和回滚
+- 解析 go.mod 文件（基于 `golang.org/x/mod/modfile`）
+- 提取模块信息（require / replace / go version）
+- 更新 go 指令
+- 提供回滚所需的原始内容快照
 
 **API**：
 ```go
 ParseGoMod(path string) (*GoMod, error)
-UpdateGoVersion(version string) error
-UpdateRequire(path, version string) error
+(*GoMod).UpdateGoVersion(version string) error
+(*GoMod).Backup() []byte
+(*GoMod).Restore(backup []byte) error
+CountDirectDeps(requires []Require) int
+CountIndirectDeps(requires []Require) int
 ```
 
 ### 3. Finder Module (`pkg/finder/`)
@@ -56,10 +67,23 @@ UpdateRequire(path, version string) error
 
 **API**：
 ```go
-ListVersions(modulePath string) ([]string, error)
-GetModuleInfo(modulePath, version string) (*ModuleMetadata, error)
-FindCompatibleVersions(modulePath, currentVersion, targetGoVersion string) (*ModuleInfo, error)
+New(projectDir string) *Finder            // 创建查询沙箱，用完 Close()
+(*Finder).ListVersions(modulePath string) ([]string, error)
+(*Finder).GetModuleInfo(modulePath, version string) (*ModuleMetadata, error)
+(*Finder).FindCompatibleVersions(modulePath, currentVersion, targetGoVersion string) (*ModuleInfo, error)
+
+GoVersionSatisfied(moduleGo, targetGo string) bool  // 基于 go/version 比较
+IsValidGoVersion(v string) bool
+SameGoLanguageVersion(a, b string) bool
 ```
+
+**两个关键设计**：
+
+*沙箱查询*：所有 `go list` 都在一个临时的最小模块里执行，而不是用户的项目目录。就地查询只有两个都不好的选项——`-mod=mod` 会在只读分析期间改写用户的 go.mod/go.sum；`-mod=readonly` 一旦问到不在 build list 里的版本就直接报 `updates to go.sum needed` 而失败。沙箱两者都能避开。
+
+*批量 + 命中即停*：版本从新到旧按批（每批 8 个）用 `go list -m -e -json` 查询，找到第一个兼容版本就返回。`-e` 让单个失败版本以内联 Error 字段出现，不会中断整批。绝大多数情况最新版就兼容，因此每个模块只需一次 `-versions` 加一次元数据查询。
+
+*版本比较*：Go 版本用 `go/version` 而非 `semver` 比较。`semver` 无法正确解析 `1.21rc1` 这类 Go 特有写法，且对非法输入返回 0（会被误判为"相等即兼容"）。比较前把 `1.21` 补成 `1.21.0`，因为 `go/version` 把裸的 `go1.21`（语言版本）排在 `go1.21.0` 之前。
 
 ### 4. UI Module (`pkg/ui/`)
 
@@ -77,9 +101,20 @@ FindCompatibleVersions(modulePath, currentVersion, targetGoVersion string) (*Mod
 ### 5. Updater Module (`pkg/updater/`)
 
 **职责**：
-- 执行模块更新
-- 运行 go mod tidy
+- 执行模块更新（`go get`）
+- 运行 `go mod tidy`
 - 错误处理和回滚
+- 校验最终落地的 go 指令
+
+**API**：
+```go
+NewUpdater(goMod *parser.GoMod) *Updater   // 构造时快照 go.mod + go.sum
+(*Updater).UpdateAllWithProgress(targetGoVersion string, modules []*finder.ModuleInfo, verbose bool, cb ProgressCallback) error
+(*Updater).VerifyGoVersion(requested string) (actual string, matched bool, err error)
+(*Updater).Rollback() error
+```
+
+`VerifyGoVersion` 存在的原因：`go mod tidy` 会在剩余依赖需要更新工具链时主动抬高 go 指令，所以"请求的版本"不等于"磁盘上的版本"。不校验就会把"降级到 1.17"悄悄变成"仍然是 1.25"。
 
 ### 6. Controller Module (`pkg/controller/`)
 
@@ -90,179 +125,243 @@ FindCompatibleVersions(modulePath, currentVersion, targetGoVersion string) (*Mod
 
 **工作流程**：
 1. 解析 go.mod
-2. 分析依赖兼容性
-3. 启动 TUI（或自动模式）
-4. 执行更新
-5. 清理和回滚（如需）
+2. 按模式分派：dry-run 只分析并打印；auto 分析后直接应用；交互模式交给 TUI
+3. TUI 自己完成更新（不再把选择结果回传给 controller 重复执行一遍）
 
 ### 7. Analyzer Module (`pkg/analyzer/`)
 
 **职责**：
-- 分析项目文件使用情况
-- 查找依赖链
-- AST 解析
+- 用 AST（`parser.ImportsOnly`）扫描哪些文件导入了某个模块
+- 通过 `go mod why -m` 解释间接依赖的来源
 
 **API**：
 ```go
 FindFilesUsingPackage(projectRoot, packagePath string) ([]string, error)
+FindWhyPackageNeeded(projectRoot, packagePath string) []string
 ```
+
+扫描时跳过 `vendor` / `.git` / `node_modules` / `testdata` 及隐藏目录；**包含** `_test.go`（测试文件也是真实使用点）；不可读的目录跳过而非中断整个遍历——详情弹窗里一个部分结果比一条错误更有用。匹配按路径边界判断，`github.com/x/lib` 不会命中 `github.com/x/libextra`。
 
 ### 8. Logger Module (`pkg/logger/`)
 
 **职责**：
-- 日志初始化
-- 统一日志接口
+- 初始化写入 `~/.go-mod-select/app.log` 的 JSON slog handler
+- 提供全局 `Log`
 
 **API**：
 ```go
-InitDefault() error
-Log.Info(msg, ...args)
-Log.Error(msg, ...args)
+InitDefault() error   // 失败不致命，调用方打印警告即可
+Init(logPath string) error
 ```
+
+`Log` 的零值是一个 discard logger，因此库代码和没调用 `Init` 的测试不会因为日志调用而 nil panic。
 
 ### 9. Config Module (`pkg/config/`)
 
 **职责**：
-- 颜色配置加载
-- 配置文件管理
+- 加载/创建颜色配置
 
 **API**：
 ```go
-LoadOrCreateDefault() (*ColorConfig, error)
-SaveColorConfig(config, path string) error
+DefaultColorConfig() *ColorConfig
+LoadColorConfig(path string) (*ColorConfig, error)   // 缺失的键沿用默认值
+LoadOrCreateDefault() (*ColorConfig, error)          // 返回可用配置 + 可选警告
+SaveColorConfig(config *ColorConfig, path string) error
 ```
+
+`LoadColorConfig` 把 JSON 反序列化到**已填好默认值**的结构体上，而不是零值结构体。否则只写了几个键的配置文件会把其余颜色变成 `""`，lipgloss 渲染为无样式——界面大面积失色，而这恰恰是最常见的用法。
 
 ## 数据流
 
 ```
-1. CLI 解析参数
+CLI 解析参数 / 校验版本 / 定位 go.mod
    ↓
-2. Parser 解析 go.mod
+Parser 解析 go.mod
    ↓
-3. Finder 并发查询版本
-   ↓
-4. UI 展示可更新模块
-   ↓
-5. 用户选择模块
-   ↓
-6. Updater 执行更新
-   ↓
-7. 成功或回滚
+┌── --dry-run ──→ Finder 分析 ──→ 打印计划，结束
+├── --auto ─────→ Finder 分析 ──→ 过滤降级 ──→ Updater 应用 ──→ 校验 go 指令
+└── 交互 ───────→ TUI
+                   ↓
+                 欢迎页 → 分析页（并发 Finder，实时日志）
+                   ↓
+                 选择页（四标签页 / 过滤 / 详情弹窗）
+                   ↓
+                 更新页（Updater + 进度回调）
+                   ↓
+                 完成页（成功摘要 或 失败+已回滚）
+                   ↓
+                 Enter 回选择页做下一轮，q 退出
 ```
 
 ## 并发模型
 
-### 版本查询（Finder）
+### 版本查询
+
+每个直接依赖一个 goroutine，用信号量限制同时运行的子进程数：
 
 ```go
-// 使用 goroutine + channel 并发查询
-// 信号量控制并发数（最多 10 个）
-semaphore := make(chan struct{}, 10)
+const analyzeConcurrency = 12
 
+semaphore := make(chan struct{}, analyzeConcurrency)
 for _, req := range requires {
-    go func(r Require) {
+    go func(r parser.Require) {
         semaphore <- struct{}{}
         defer func() { <-semaphore }()
-
-        info, err := finder.FindCompatibleVersions(...)
-        if err == nil {
-            results <- info
-        }
+        info, err := f.FindCompatibleVersions(r.Path, r.Version, targetGoVersion)
+        // 结果在 mutex 下收集，避免 worker 阻塞在无人读取的 channel 上
     }(req)
 }
 ```
+
+并发数刻意保持较小：每个 worker 会 fork 一个做网络 IO 的 `go list` 子进程。之前的 200 会为大 go.mod 拉起数百个进程，既被 proxy 限流，也让操作系统在上下文切换上白花开销。
+
+### TUI 中的慢操作
+
+`go mod why` 和源码目录遍历都慢到肉眼可感。它们通过 `tea.Cmd` 在事件循环外执行，弹窗先立刻渲染模块信息，结果到达后再填充；期间的按键和 spinner 不受影响。晚到的结果会用模块名比对当前弹窗，不匹配就丢弃。
 
 ## 错误处理
 
 ### 分层错误处理
 
-1. **Finder** - 跳过失败的模块，记录日志
-2. **Updater** - 更新失败时自动回滚
-3. **Controller** - 捕获所有错误，友好提示
+1. **Finder** - 跳过失败的模块/版本，记录日志；无法解析的 go 版本按"兼容"处理（漏报一次更新比误把模块排除更可接受）
+2. **Updater** - 更新失败时回滚 go.mod 和 go.sum
+3. **Controller / TUI** - 展示失败原因并说明已回滚
 
 ### 回滚机制
 
 ```go
-// 1. 备份原始文件
-backup := goMod.Backup()
+// NewUpdater 时快照两个文件
+u := updater.NewUpdater(goMod)   // 内部保存 go.mod、go.sum 内容及 go.sum 是否原本存在
 
-// 2. 执行更新
-err := updater.Update(modules)
-
-// 3. 失败时回滚
-if err != nil {
-    goMod.Restore(backup)
+// 任一步失败都回滚
+if err := u.UpdateAllWithProgress(...); err != nil {
+    // 内部已 Rollback：go.mod 恢复、go.sum 恢复；
+    // 原本不存在 go.sum 时，删除新生成的那个
 }
 ```
 
+只恢复 go.mod 是不够的：`go get` 同时改写 go.sum，留下不一致的 go.sum 会让模块无法构建。
+
 ## TUI 架构
+
+### 五个屏幕
+
+`screenWelcome` → `screenAnalyzing` → `screenSelection` → `screenUpdating` → `screenComplete`，完成后可回到 `screenSelection` 做下一轮。
 
 ### Bubbletea 模型
 
 ```go
 type AppModel struct {
-    // 状态
+    // 状态机
     currentScreen   screen
     currentTab      tabType
 
     // 数据
-    updateModules   []*SelectableModule
-    requireModules  []parser.Require
-    indirectModules []parser.Require
-    replaceModules  []ReplaceInfo
+    updateModules   []*SelectableModule   // 可选，带 Selected / Updated 标志
+    requireModules  []parser.Require      // 只读
+    indirectModules []parser.Require      // 只读
+    replaceModules  []ReplaceInfo         // 只读
+
+    // 选择页交互
+    cursor          int
+    filterMode      bool                  // 正在输入过滤词
+    filterInput     string                // 已输入/已应用的过滤词
+    showingDetail   bool
+    detailModule    string                // 用于丢弃过期的异步结果
+
+    // 进度
+    analyzingLogOffset int                // 分析日志滚动位置
+    analyzingLogFollow bool               // 是否跟随最新
+    tidySucceeded      bool
+    updateFailed       bool
+    updateError        error
+    actualGoVersion    string             // tidy 之后磁盘上的实际版本
+    goVersionMatched   bool
 
     // UI 组件
-    viewport        viewport.Model
-    detailViewport  viewport.Model
-    spinner         spinner.Model
-    progress        progress.Model
+    viewport, detailViewport viewport.Model
+    spinner  spinner.Model
+    progress progress.Model
 
-    // 配置
-    colors          *config.ColorConfig
+    colors *config.ColorConfig
 }
 ```
+
+派生状态刻意不缓存：`countSelected()`、`getVisibleUpdateModules()`、`updatedModules()` 每次渲染重算。列表规模是几十到几百，重算的成本远低于缓存失效带来的 bug。
+
+### 消息
+
+| 消息 | 来源 | 作用 |
+|------|------|------|
+| `startAnalysisMsg` | 欢迎页按 Enter | 启动分析 worker |
+| `analyzeProgressMsg` | 分析 worker | 单个模块的 checking/found/skipped/error |
+| `analyzeCompleteMsg` | 分析 worker | 全部结果，切到选择页 |
+| `startUpdateMsg` | 选择页按 Enter | 启动更新 worker |
+| `updateProgressMsg` | 更新 worker | 每个模块 + tidy 的进度 |
+| `updateFailedMsg` | 更新 worker | 失败原因（此时已回滚完成） |
+| `updateCompleteMsg` | 更新 worker | 结束，附带实际 go 版本 |
+| `detailLoadedMsg` | 详情加载 Cmd | 弹窗的异步正文 |
 
 ### 事件处理
 
 ```
-KeyMsg → Update() → 更新 Model → View() → 渲染
+KeyMsg → handleKeyPress() → 按 currentScreen 分派 → 更新 Model → View() → 渲染
 ```
+
+按键判定顺序很关键：`Ctrl+C`（全局）→ 弹窗 → **过滤输入** → 命令绑定。过滤输入必须排在命令绑定之前，否则输入模块名里的 `q` 会退出程序。
+
+日志条目以 `[STATUS]pkg` 的形式存储，而不是预渲染好的带色文本。这样窗口尺寸变化时能重新上色，也让完成状态可以就地替换自己的 `[CHECKING]` 占位行。
 
 ## 依赖关系
 
 ```
 main
- └── cmd/root
+ └── cmd/root ── finder（版本格式校验）
       └── controller
            ├── parser
            ├── finder
            ├── ui
            │    ├── analyzer
-           │    └── config
-           ├── updater
-           └── logger
+           │    ├── config
+           │    ├── finder
+           │    └── updater
+           └── updater
 ```
+
+`logger` 被几乎所有包引用，未在图中展开。
 
 ## 性能优化
 
-1. **并发查询** - 同时查询多个模块版本（限制 10 个并发）
-2. **缓存** - Bubbletea 的 viewport 自动缓存渲染结果
-3. **增量更新** - 只更新选中的模块
-4. **懒加载** - 详情弹窗按需生成内容
+1. **批量元数据查询 + 命中即停** - 每模块通常两次子进程调用，而不是"每个已发布版本一次"。本项目上 `--dry-run` 从 16.0s 降到 0.21s
+2. **有界并发** - 12 个 worker，避免进程爆炸和 proxy 限流
+3. **异步详情** - `go mod why` 和源码遍历不阻塞事件循环
+4. **增量更新** - 只更新选中的模块；已应用的模块不会在第二轮重复 `go get`
+
+## 已知限制
+
+- **不提议 v2+ 大版本升级**。Go 把 v2 及以上放在带 `/vN` 后缀的独立模块路径下，`go list -m -versions` 不会把 v2 报告为 v1 的可用版本。这类升级需要改 import 路径，属于人工决策
+- **只分析直接依赖**。间接依赖仅展示，不参与更新——它们应由 `go mod tidy` 根据直接依赖推导
+- **不检查 replace 指令的兼容性**。被 replace 的模块按原路径查询，本地 replace 的实际内容不会被检查
+- **`go mod tidy` 可能抬高 go 指令**至目标版本之上。这不是 bug 而是 go 工具的行为，工具会检测并报告，但不会阻止
+- **配置只在启动时读取**，修改颜色需要重启
+- **需要网络**（或已预热的模块缓存）；离线时所有版本查询都会失败
 
 ## 测试策略
 
-- **单元测试** - 各模块独立测试
-- **集成测试** - 完整流程测试
-- **手动测试** - TUI 交互测试
+- **单元测试** - 版本比较边界、回滚语义、按键处理、渲染分支、配置合并、模块根查找、`go list -json` 流式解析
+- **PTY 手工验证** - 用 `expect` 驱动真实 TUI 验证过滤输入、弹窗异步加载、完整更新流程、中途退出不残留临时目录。这类问题（如过滤框里的 `q`）单元测试容易漏，但目前**只是开发时的一次性脚本，尚未沉淀进仓库**，改动 TUI 后需要手工重跑
+- **手动测试** - 视觉细节、配色
+
+不打网络的测试都用 `t.TempDir()` 和 `t.Setenv("GOPROXY", "off")`，因此可以离线跑。
 
 ## 扩展性
 
 ### 添加新标签页
 
-1. 在 `app_model.go` 添加 `tabType` 常量
+1. 在 `app_model.go` 的 `tabType` 中新增常量（放在 `tabCount` 之前，循环逻辑依赖它）
 2. 在 `renderModuleList()` 添加渲染逻辑
-3. 在 `getDetailContent()` 添加详情逻辑
+3. 在 `detailHeader()` / `loadDetailBody()` 添加详情逻辑
+4. 在 `getMaxCursor()` 和 `renderTabs()` 补上对应分支
 
 ### 添加新命令
 
@@ -270,6 +369,12 @@ main
 2. 实现命令处理函数
 3. 调用相应的控制器方法
 
+### 添加新的颜色配置项
+
+1. 在 `pkg/config/colors.go` 的 `ColorConfig` 加字段（带 `json` tag）
+2. **在 `DefaultColorConfig()` 里给默认值** —— 漏掉会让该项渲染为无样式文本，`TestDefaultConfigIsFullyPopulated` 会捕获这个疏漏
+3. 同步更新 `colors.example.json` 和 [配置说明](./configuration.md#配置项说明)
+
 ### 自定义颜色配置
 
-修改 `~/.go-mod-select/colors.json` 即可。
+修改 `~/.go-mod-select/colors.json` 即可，只写想改的键。详见 [配置说明](./configuration.md#颜色配置)。

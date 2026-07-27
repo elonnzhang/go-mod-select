@@ -58,3 +58,4 @@ debug
 
 # AI
 .claude/
+.*-cc/
