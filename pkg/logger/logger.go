@@ -1,12 +1,15 @@
 package logger
 
 import (
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 )
 
-var Log *slog.Logger
+// Log is safe to use before Init: it starts as a discard logger so library
+// code (and tests that never call Init) cannot nil-panic on a log call.
+var Log = slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 // Init initializes the logger with file output
 func Init(logPath string) error {

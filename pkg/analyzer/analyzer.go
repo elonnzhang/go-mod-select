@@ -1,43 +1,71 @@
 package analyzer
 
 import (
+	"bytes"
 	"fmt"
 	"go/parser"
 	"go/token"
-	"os"
+	"io/fs"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
-// FindFilesUsingPackage finds all .go files that import a given package
+// maxWhyChainLines caps how much of a `go mod why` chain is shown in the
+// detail popup; deep chains are informative for the first few hops only.
+const maxWhyChainLines = 15
+
+// skipDirs are directories that never contain first-party source worth
+// attributing an import to.
+var skipDirs = map[string]bool{
+	"vendor":       true,
+	".git":         true,
+	".idea":        true,
+	".vscode":      true,
+	"node_modules": true,
+	"testdata":     true,
+}
+
+// FindFilesUsingPackage finds all .go files under projectRoot that import
+// packagePath (or any package beneath it), returned as sorted relative paths.
+//
+// Unreadable directories are skipped rather than aborting the walk: a partial
+// answer is more useful in a detail popup than an error.
 func FindFilesUsingPackage(projectRoot, packagePath string) ([]string, error) {
 	var usingFiles []string
 
-	err := filepath.Walk(projectRoot, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(projectRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 
-		// Skip vendor and .git directories
-		if info.IsDir() && (info.Name() == "vendor" || info.Name() == ".git" || info.Name() == ".idea") {
-			return filepath.SkipDir
+		if d.IsDir() {
+			name := d.Name()
+			// Skip build/tooling dirs and hidden dirs, but never the root
+			// itself (which may legitimately be a dotted path).
+			if path != projectRoot && (skipDirs[name] || strings.HasPrefix(name, ".")) {
+				return fs.SkipDir
+			}
+			return nil
 		}
 
-		// Only process .go files (excluding test files for now)
-		if !info.IsDir() && strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
-			if usesPackage(path, packagePath) {
-				// Make path relative to project root
-				relPath, err := filepath.Rel(projectRoot, path)
-				if err == nil {
-					usingFiles = append(usingFiles, relPath)
-				}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+
+		if usesPackage(path, packagePath) {
+			if relPath, relErr := filepath.Rel(projectRoot, path); relErr == nil {
+				usingFiles = append(usingFiles, relPath)
 			}
 		}
-
 		return nil
 	})
 
+	sort.Strings(usingFiles)
 	return usingFiles, err
 }
 
@@ -59,31 +87,41 @@ func usesPackage(filePath, packagePath string) bool {
 	return false
 }
 
-// FindWhyPackageNeeded uses go mod why to find why a package is needed
+// FindWhyPackageNeeded uses go mod why to find why a package is needed.
+//
+// -mod=readonly keeps the inspection side-effect free: the user is only
+// browsing a detail popup and should not have their go.mod rewritten by it.
 func FindWhyPackageNeeded(projectRoot, packagePath string) []string {
-	cmd := exec.Command("go", "mod", "why", "-m", packagePath)
+	cmd := exec.Command("go", "mod", "why", "-m", "-mod=readonly", packagePath)
 	cmd.Dir = projectRoot
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return []string{fmt.Sprintf("• (Unable to determine: %v)", err)}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return []string{fmt.Sprintf("  • (Unable to determine: %s)", detail)}
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 	var reasons []string
 
-	// Parse go mod why output
-	// Format is: # packagePath
-	//            chain of imports
-	for i, line := range lines {
+	// go mod why output is a "# module" header followed by the import chain.
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Show the dependency chain
-		if i < 15 { // Limit to first few lines
-			reasons = append(reasons, fmt.Sprintf("  • %s", line))
+		if len(reasons) >= maxWhyChainLines {
+			reasons = append(reasons, "  • …")
+			break
 		}
+		reasons = append(reasons, fmt.Sprintf("  • %s", line))
 	}
 
 	if len(reasons) == 0 {

@@ -116,7 +116,7 @@ func (gm *GoMod) UpdateGoVersion(version string) error {
 		return fmt.Errorf("failed to format go.mod: %w", err)
 	}
 
-	if err := os.WriteFile(gm.FilePath, formatted, 0o644); err != nil {
+	if err := writePreservingMode(gm.FilePath, formatted); err != nil {
 		return fmt.Errorf("failed to write go.mod: %w", err)
 	}
 
@@ -124,49 +124,24 @@ func (gm *GoMod) UpdateGoVersion(version string) error {
 	return nil
 }
 
-// UpdateRequire updates a single dependency version
-func (gm *GoMod) UpdateRequire(path, version string) error {
-	content, err := os.ReadFile(gm.FilePath)
-	if err != nil {
-		return fmt.Errorf("failed to read go.mod: %w", err)
+// writePreservingMode overwrites path, keeping its existing permission bits.
+// A hard-coded 0o644 would silently widen a deliberately stricter mode.
+func writePreservingMode(path string, data []byte) error {
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
 	}
-
-	file, err := modfile.Parse(gm.FilePath, content, nil)
-	if err != nil {
-		return fmt.Errorf("failed to parse go.mod: %w", err)
-	}
-
-	// Update the require statement
-	if err := file.AddRequire(path, version); err != nil {
-		return fmt.Errorf("failed to update require: %w", err)
-	}
-
-	// Format and write back
-	formatted, err := file.Format()
-	if err != nil {
-		return fmt.Errorf("failed to format go.mod: %w", err)
-	}
-
-	if err := os.WriteFile(gm.FilePath, formatted, 0o644); err != nil {
-		return fmt.Errorf("failed to write go.mod: %w", err)
-	}
-
-	return nil
+	return os.WriteFile(path, data, mode)
 }
 
-// Save writes the current state to the go.mod file
-func (gm *GoMod) Save() error {
-	return os.WriteFile(gm.FilePath, gm.Content, 0o644)
-}
-
-// Backup returns the original content for rollback
+// Backup returns the go.mod content as it was when parsed, for rollback.
 func (gm *GoMod) Backup() []byte {
 	return gm.Content
 }
 
 // Restore restores the go.mod file from backup
 func (gm *GoMod) Restore(backup []byte) error {
-	return os.WriteFile(gm.FilePath, backup, 0o644)
+	return writePreservingMode(gm.FilePath, backup)
 }
 
 func CountDirectDeps(requires []Require) int {

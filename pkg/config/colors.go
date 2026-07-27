@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -38,50 +39,58 @@ type ColorConfig struct {
 	Log     string `json:"log"`
 }
 
-// DefaultColorConfig Default color configuration
+// DefaultColorConfig returns the built-in theme.
+//
+// Values are hex; an 8-digit form is accepted and its alpha byte ignored, since
+// terminals have no alpha channel.
 func DefaultColorConfig() *ColorConfig {
 	return &ColorConfig{
-		Title:         "#7d3de3ff", // Purple
-		Header:        "#7d3de3ff", // Purple
-		Border:        "#5f87af",   // Purple
-		TabActive:     "#7d3de3ff", // Pink
-		TabInactive:   "#626262",   // Gray
-		TabBackground: "#bdd4dfff", // Dark gray
-		Help:          "#a4cf64ff", // Gray
+		Title:         "#7d3de3ff", // violet
+		Header:        "#7d3de3ff", // violet
+		Border:        "#5f87af",   // steel blue
+		TabActive:     "#7d3de3ff", // violet, on a light background
+		TabInactive:   "#626262",   // mid gray
+		TabBackground: "#bdd4dfff", // pale blue
+		Help:          "#a4cf64ff", // olive green
 
-		Patch:      "#00d700", // Green
-		Minor:      "#ffd700", // Yellow
-		Major:      "#00afff", // Cyan
-		Prerelease: "#ff0000", // Red
+		Patch:      "#00d700", // green
+		Minor:      "#ffd700", // yellow
+		Major:      "#00afff", // cyan
+		Prerelease: "#ff0000", // red
 
-		Selected: "#7d3de3ff", // Purple
-		Cursor:   "#7d3de3ff", // Purple
+		Selected: "#7d3de3ff", // violet
+		Cursor:   "#7d3de3ff", // violet
 
-		PopupBorder: "#ff5faf", // Pink
+		PopupBorder: "#ff5faf", // pink
 
-		Info:    "#5fffd7",   // Cyan
-		Success: "#a4cf64ff", // Green
-		Log:     "#cfd4b7ff", // Gray
+		Info:    "#5fffd7",   // aqua
+		Success: "#a4cf64ff", // olive green
+		Log:     "#cfd4b7ff", // pale khaki
 	}
 }
 
-// LoadColorConfig loads color configuration from file
+// LoadColorConfig loads color configuration from file.
+//
+// Missing keys keep their default value: unmarshalling onto a zero struct would
+// turn every unspecified field into "", which lipgloss renders as no styling at
+// all. That makes a partial theme file — the common case, since most people
+// only want to change a few colors — silently blank most of the UI.
 func LoadColorConfig(path string) (*ColorConfig, error) {
+	config := DefaultColorConfig()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Return default config if file doesn't exist
-			return DefaultColorConfig(), nil
+			return config, nil
 		}
 		return nil, err
 	}
 
-	var config ColorConfig
-	if err := json.Unmarshal(data, &config); err != nil {
+	if err := json.Unmarshal(data, config); err != nil {
 		return nil, err
 	}
 
-	return &config, nil
+	return config, nil
 }
 
 // SaveColorConfig saves color configuration to file
@@ -109,26 +118,26 @@ func GetDefaultConfigPath() (string, error) {
 	return filepath.Join(homeDir, ".go-mod-select", "colors.json"), nil
 }
 
-// LoadOrCreateDefault loads config or creates default if not exists
+// LoadOrCreateDefault loads the color config, writing a default file the first
+// time so users have something to edit.
+//
+// A write failure is not fatal: a read-only home directory should not stop the
+// TUI from running with the defaults it already has in memory.
 func LoadOrCreateDefault() (*ColorConfig, error) {
 	configPath, err := GetDefaultConfigPath()
 	if err != nil {
 		return nil, err
 	}
 
-	config, err := LoadColorConfig(configPath)
-	if err != nil {
-		return nil, err
-	}
-
-	// If config file doesn't exist, create it with defaults
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
+		config := DefaultColorConfig()
 		if err := SaveColorConfig(config, configPath); err != nil {
-			return nil, err
+			return config, fmt.Errorf("could not write default color config: %w", err)
 		}
+		return config, nil
 	}
 
-	return config, nil
+	return LoadColorConfig(configPath)
 }
 
 // ToLipglossColor converts hex color string to lipgloss.Color

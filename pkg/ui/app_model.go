@@ -2,11 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 
 	"go-mod-select/pkg/config"
 	"go-mod-select/pkg/finder"
 	"go-mod-select/pkg/logger"
 	"go-mod-select/pkg/parser"
+	"go-mod-select/pkg/updater"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/progress"
@@ -35,6 +37,7 @@ const (
 	tabRequire                 // Read-only - shows current require directives
 	tabIndirect                // Read-only - shows current indirect requires
 	tabReplace                 // Read-only - shows current replace directives
+	tabCount                   // sentinel: number of tabs, used for cycling
 )
 
 // SelectableModule represents a module that can be selected in the UI
@@ -68,25 +71,35 @@ type AppModel struct {
 	filterInput     string
 	showingDetail   bool           // Whether showing detail popup
 	detailContent   string         // Content of detail popup
+	detailModule    string         // Module the popup describes, to drop stale async results
 	detailViewport  viewport.Model // Viewport for scrollable detail popup
 
 	// Progress state
 	spinner            spinner.Model
 	progress           progress.Model
-	analyzingStatus    string
 	analyzingPackage   string // Current package being analyzed
 	analyzingCount     int    // Number of packages analyzed
 	analyzingTotal     int    // Total packages to analyze
 	analyzingLogOffset int    // Scroll offset for analysis logs
-	updatingStatus     string
+	analyzingLogFollow bool   // Auto-scroll to newest log until the user scrolls up
 	currentModule      int
 	totalModules       int
+	tidySucceeded      bool   // go mod tidy reported success in this update run
+	tidyRunning        bool   // go mod tidy is in flight (not a per-module step)
+	updateFailed       bool   // at least one step of the update run failed
+	updateError        error  // why the update run failed, if it did
+	actualGoVersion    string // go directive found on disk after the update
+	goVersionMatched   bool   // whether that matches what was requested
 
 	// Update subscription
 	updateSub chan tea.Msg // Channel for receiving update progress
 
 	// Analysis subscription
 	analysisSub chan tea.Msg // Channel for receiving real-time progress updates
+
+	// quit is closed when the program is shutting down. Background workers
+	// select on it so they never block sending to a channel nobody reads.
+	quit chan struct{}
 
 	// Logs - separate logs for different screens
 	analysisLogs  []string // Full logs for analysis screen (all logs, scrollable)
@@ -97,10 +110,6 @@ type AppModel struct {
 	width  int
 	height int
 	ready  bool
-
-	// Result
-	confirmed bool
-	cancelled bool
 }
 
 type ReplaceInfo struct {
@@ -137,7 +146,24 @@ type updateProgressMsg struct {
 	status  string // "updating", "success", "error", "tidying"
 }
 
-type updateCompleteMsg struct{}
+// updateCompleteMsg ends an update run. actualGoVersion is the go directive
+// found on disk afterwards, which `go mod tidy` may have raised above the
+// requested one.
+type updateCompleteMsg struct {
+	actualGoVersion  string
+	goVersionMatched bool
+}
+
+// updateFailedMsg carries the reason an update run aborted. The updater has
+// already restored go.mod and go.sum by the time this is sent.
+type updateFailedMsg struct{ err error }
+
+// detailLoadedMsg delivers the slow half of a detail popup once the source walk
+// or `go mod why` has finished.
+type detailLoadedMsg struct {
+	module string
+	body   string
+}
 
 type startUpdateMsg struct {
 	modules         []*finder.ModuleInfo
@@ -147,14 +173,15 @@ type startUpdateMsg struct {
 
 // InitialAppModel creates a new AppModel with default values
 func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot string) AppModel {
-	// Load color configuration
+	// A broken or unwritable theme file degrades to the defaults rather than
+	// failing the run; LoadOrCreateDefault returns a usable config either way.
 	colors, err := config.LoadOrCreateDefault()
 	if err != nil {
-		logger.Log.Error("failed to load color config, using defaults", "error", err)
+		logger.Log.Warn("color config unavailable, using defaults", "error", err)
+	}
+	if colors == nil {
 		colors = config.DefaultColorConfig()
 	}
-
-	logger.Log.Info("color configuration loaded")
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -177,6 +204,7 @@ func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot st
 		analysisLogs:    []string{},
 		operationLogs:   []string{},
 		updateLogs:      []string{},
+		quit:            make(chan struct{}),
 		currentTab:      tabUpdate, // Start with Update tab
 	}
 }
@@ -203,62 +231,53 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Height = m.getViewportHeight()
 			m.updateViewport()
 		}
+
+		// An open popup must be resized too, or the border is drawn at the new
+		// width around content laid out for the old one.
+		if m.showingDetail {
+			w, h := m.detailViewportSize()
+			m.detailViewport.Width = w
+			m.detailViewport.Height = h
+			m.detailViewport.SetContent(m.detailContent)
+		}
 		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKeyPress(msg)
 
 	case startAnalysisMsg:
-		// Start the subscription and listen for the first message
 		m.analysisSub = make(chan tea.Msg)
-		go startAnalysisWorker(msg, m.analysisSub)
+		go startAnalysisWorker(msg, m.analysisSub, m.quit)
 		return m, waitForAnalysisMsg(m.analysisSub)
 
 	case startUpdateMsg:
-		// Start the update subscription and listen for the first message
 		m.updateSub = make(chan tea.Msg)
-		go startUpdateWorker(msg, m.updateSub)
+		go startUpdateWorker(msg, m.updateSub, m.quit)
 		return m, waitForUpdateMsg(m.updateSub)
 
 	case analyzeCompleteMsg:
-		// Close subscription when analysis is complete
-		if m.analysisSub != nil {
-			close(m.analysisSub)
-			m.analysisSub = nil
-		}
+		// Drop the reference rather than close(): the worker is the only sender
+		// and it has already finished, so closing buys nothing and would panic
+		// if any future path sent again.
+		m.analysisSub = nil
 		return m.handleAnalyzeComplete(msg)
 
 	case analyzeProgressMsg:
 		m.analyzingTotal = msg.total
 
-		// Add log entry to analysis logs based on status with color tags
-		logEntry := ""
-		switch msg.status {
-		case "checking":
-			// Log checking status with progress indicator
-			logEntry = fmt.Sprintf("[CHECKING]%s", msg.packageName)
+		if msg.status == statusChecking {
 			m.analyzingPackage = msg.packageName
-		case "found":
-			logEntry = fmt.Sprintf("[FOUND]%s", msg.packageName)
-			// Update count only on completion
-			if msg.current > m.analyzingCount {
-				m.analyzingCount = msg.current
-			}
-		case "skipped":
-			logEntry = fmt.Sprintf("[SKIPPED]%s", msg.packageName)
-			// Update count only on completion
-			if msg.current > m.analyzingCount {
-				m.analyzingCount = msg.current
-			}
-		case "error":
-			logEntry = fmt.Sprintf("[ERROR]%s", msg.packageName)
-			// Update count only on completion
-			if msg.current > m.analyzingCount {
-				m.analyzingCount = msg.current
-			}
+		} else if msg.current > m.analyzingCount {
+			// Only completions advance the counter; a "checking" message is
+			// emitted before its work happens.
+			m.analyzingCount = msg.current
 		}
-		if logEntry != "" {
-			m.updateOrAddAnalysisLog(logEntry)
+		m.updateOrAddAnalysisLog(msg.status, msg.packageName)
+
+		// Keep the log pinned to the newest entry unless the user scrolled up
+		// to read history.
+		if m.analyzingLogFollow {
+			m.analyzingLogOffset = m.maxAnalyzingLogOffset()
 		}
 
 		// Continue listening for more progress messages
@@ -268,33 +287,49 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case updateProgressMsg:
-		m.currentModule = msg.current
-		m.totalModules = msg.total
-		m.updatingStatus = msg.module
+		isTidy := msg.module == updater.TidyLabel
 
-		// Add log entry based on status
+		// The tidy step reports 0/0 because it is not per-module. Assigning
+		// that would zero the counters and hide the progress bar during the
+		// slowest step of the run, so leave them at the module totals.
+		if !isTidy {
+			m.currentModule = msg.current
+			m.totalModules = msg.total
+		}
+
 		logEntry := ""
 		switch msg.status {
 		case "updating":
-			if msg.module == "go mod tidy" {
-				logEntry = "⏳ Running go mod tidy..."
+			if isTidy {
+				logEntry = "⏳ Running `go mod tidy`..."
+				m.tidyRunning = true
 			} else {
 				logEntry = fmt.Sprintf("⏳ [%d/%d] Updating %s...", msg.current, msg.total, msg.module)
 			}
 		case "success":
-			if msg.module == "go mod tidy" {
+			if isTidy {
 				logEntry = "✓ `go mod tidy` completed"
+				m.tidySucceeded = true
+				m.tidyRunning = false
 			} else {
 				logEntry = fmt.Sprintf("✓ [%d/%d] %s updated successfully", msg.current, msg.total, msg.module)
+				// Mark the module updated here, while we know which one
+				// succeeded. The completion screen reads this, so deriving it
+				// by re-parsing log strings later is both fragile and — since
+				// it ran before the flag was set — produced an empty summary.
+				m.markUpdated(msg.module)
 			}
 		case "error":
-			if msg.module == "go mod tidy" {
+			if isTidy {
 				logEntry = "✗ `go mod tidy` failed"
+				m.tidyRunning = false
 			} else {
 				logEntry = fmt.Sprintf("✗ [%d/%d] %s update failed", msg.current, msg.total, msg.module)
 			}
+			m.updateFailed = true
 		case "tidying":
 			logEntry = "⏳ Running `go mod tidy`..."
+			m.tidyRunning = true
 		}
 		if logEntry != "" {
 			m.updateLogs = append(m.updateLogs, logEntry)
@@ -306,13 +341,41 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case updateCompleteMsg:
-		// Close subscription when update is complete
+	case updateFailedMsg:
+		m.updateFailed = true
+		m.updateError = msg.err
+		m.updateLogs = append(m.updateLogs,
+			fmt.Sprintf("✗ %v", msg.err),
+			"↩ go.mod and go.sum restored to their previous contents")
+
 		if m.updateSub != nil {
-			close(m.updateSub)
-			m.updateSub = nil
+			return m, waitForUpdateMsg(m.updateSub)
+		}
+		return m, nil
+
+	case updateCompleteMsg:
+		// Drop the reference rather than close() — see analyzeCompleteMsg.
+		m.updateSub = nil
+		m.actualGoVersion = msg.actualGoVersion
+		m.goVersionMatched = msg.goVersionMatched
+		if m.updateFailed {
+			// A rollback undid every applied version, so nothing may be shown
+			// as updated on the summary screen.
+			for _, mod := range m.updateModules {
+				mod.Updated = false
+			}
 		}
 		m.currentScreen = screenComplete
+		return m, nil
+
+	case detailLoadedMsg:
+		// Discard a late result for a popup the user has already closed or
+		// moved on from.
+		if !m.showingDetail || msg.module != m.detailModule {
+			return m, nil
+		}
+		m.detailContent = strings.TrimSuffix(m.detailContent, detailLoadingNotice) + msg.body
+		m.detailViewport.SetContent(m.detailContent)
 		return m, nil
 
 	case spinner.TickMsg:
@@ -331,21 +394,26 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKeyPress Handle key presses
 func (m AppModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Global quit
-	if key.Matches(msg, keys.Quit) {
-		m.cancelled = true
+	// Ctrl+C always quits. Plain "q" is deliberately not global: on the
+	// selection screen it has to reach the filter input, where it is a literal
+	// character, not a command.
+	if key.Matches(msg, keys.ForceQuit) {
 		return m, tea.Quit
 	}
 
 	switch m.currentScreen {
 	case screenWelcome:
-		if key.Matches(msg, keys.Enter) {
+		switch {
+		case key.Matches(msg, keys.Quit):
+			return m, tea.Quit
+		case key.Matches(msg, keys.Enter):
 			m.currentScreen = screenAnalyzing
 			// Initialize analysis counters
 			m.analyzingTotal = parser.CountDirectDeps(m.goMod.Requires)
 			m.analyzingCount = 0
 			m.analyzingPackage = ""
-			m.analyzingLogOffset = 0 // Reset scroll offset
+			m.analyzingLogOffset = 0
+			m.analyzingLogFollow = true
 			return m, tea.Batch(
 				m.spinner.Tick,
 				m.analyzeModules(),
@@ -353,56 +421,68 @@ func (m AppModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case screenAnalyzing:
-		// Handle scrolling in analysis logs
+		// Scroll the analysis log. Scrolling up detaches from the tail so the
+		// user can read history while workers keep appending.
 		switch {
+		case key.Matches(msg, keys.Quit):
+			return m, tea.Quit
 		case key.Matches(msg, keys.Up):
 			if m.analyzingLogOffset > 0 {
 				m.analyzingLogOffset--
+				m.analyzingLogFollow = false
 			}
 			return m, nil
 		case key.Matches(msg, keys.Down):
-			// Allow scrolling down if there are hidden logs
-			logCount := len(m.analysisLogs)
-			if logCount > m.getAnalyzingLogVisibleLines() {
-				maxOffset := logCount - m.getAnalyzingLogVisibleLines()
-				if m.analyzingLogOffset < maxOffset {
-					m.analyzingLogOffset++
-				}
+			maxOffset := m.maxAnalyzingLogOffset()
+			if m.analyzingLogOffset < maxOffset {
+				m.analyzingLogOffset++
 			}
+			m.analyzingLogFollow = m.analyzingLogOffset >= maxOffset
 			return m, nil
 		case key.Matches(msg, keys.PageUp):
-			m.analyzingLogOffset = max(0, m.analyzingLogOffset-10)
+			if m.analyzingLogOffset > 0 {
+				m.analyzingLogOffset = max(0, m.analyzingLogOffset-10)
+				m.analyzingLogFollow = false
+			}
 			return m, nil
 		case key.Matches(msg, keys.PageDown):
-			logCount := len(m.analysisLogs)
-			if logCount > m.getAnalyzingLogVisibleLines() {
-				maxOffset := logCount - m.getAnalyzingLogVisibleLines()
-				m.analyzingLogOffset = min(maxOffset, m.analyzingLogOffset+10)
-			}
+			maxOffset := m.maxAnalyzingLogOffset()
+			m.analyzingLogOffset = min(maxOffset, m.analyzingLogOffset+10)
+			m.analyzingLogFollow = m.analyzingLogOffset >= maxOffset
+			return m, nil
+		case key.Matches(msg, keys.End):
+			m.analyzingLogOffset = m.maxAnalyzingLogOffset()
+			m.analyzingLogFollow = true
 			return m, nil
 		}
 
 	case screenSelection:
 		return m.handleSelectionInput(msg)
 
+	case screenUpdating:
+		// The update is mutating go.mod; only a hard interrupt is honoured.
+		return m, nil
+
 	case screenComplete:
-		if key.Matches(msg, keys.Enter) {
-			// Mark updated modules and return to selection screen
+		switch {
+		case key.Matches(msg, keys.Quit):
+			return m, tea.Quit
+		case key.Matches(msg, keys.Enter):
+			// Deselect the modules that were just applied and go back to the
+			// list so the user can pick another batch.
 			for _, mod := range m.updateModules {
-				if mod.Selected {
-					mod.Updated = true
-					mod.Selected = false // Deselect after update
+				if mod.Updated {
+					mod.Selected = false
 				}
 			}
 
-			// Return to selection screen
 			m.currentScreen = screenSelection
 			m.cursor = 0
+			m.currentTab = tabUpdate
+			m.updateError = nil
+			m.updateFailed = false
 			m.updateViewport()
 			return m, nil
-		}
-		if key.Matches(msg, keys.Quit) {
-			return m, tea.Quit
 		}
 	}
 
@@ -413,38 +493,43 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// If showing detail popup, handle scrolling and closing
 	if m.showingDetail {
 		switch {
-		case key.Matches(msg, keys.Esc):
+		case key.Matches(msg, keys.Esc), key.Matches(msg, keys.Quit):
 			m.showingDetail = false
 			m.detailContent = ""
+			m.detailModule = ""
 			return m, nil
 		case key.Matches(msg, keys.Up):
-			m.detailViewport.LineUp(1)
+			m.detailViewport.ScrollUp(1)
 			return m, nil
 		case key.Matches(msg, keys.Down):
-			m.detailViewport.LineDown(1)
+			m.detailViewport.ScrollDown(1)
 			return m, nil
 		case key.Matches(msg, keys.PageUp):
-			m.detailViewport.ViewUp()
+			m.detailViewport.HalfPageUp()
 			return m, nil
 		case key.Matches(msg, keys.PageDown):
-			m.detailViewport.ViewDown()
+			m.detailViewport.HalfPageDown()
 			return m, nil
 		}
 		// Ignore other keys when showing detail
 		return m, nil
 	}
 
-	// Only allow selection in Update tab
-	canSelect := m.currentTab == tabUpdate
-
+	// Filter input owns every printable key, including q — checked before the
+	// command bindings so typing a module name cannot quit the app.
 	if m.filterMode {
 		return m.handleFilterInput(msg)
 	}
 
+	// Only allow selection in Update tab
+	canSelect := m.currentTab == tabUpdate
+
 	switch {
+	case key.Matches(msg, keys.Quit):
+		return m, tea.Quit
+
 	case key.Matches(msg, keys.Enter):
 		if canSelect {
-			// Check if any modules are selected
 			selectedCount := 0
 			for _, mod := range m.updateModules {
 				if mod.Selected && !mod.Updated {
@@ -453,69 +538,98 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 
 			if selectedCount == 0 {
-				// No modules selected, show message and don't proceed
 				m.addOperationLog("No modules selected for update")
 				return m, nil
 			}
 
-			m.confirmed = true
 			m.currentScreen = screenUpdating
+			m.updateLogs = nil
+			m.tidySucceeded = false
+			m.tidyRunning = false
+			m.updateFailed = false
+			m.currentModule = 0
+			m.totalModules = 0
 			return m, m.performUpdate()
 		}
 
+	case key.Matches(msg, keys.Esc):
+		// Clear an applied filter without re-entering filter mode.
+		if m.filterInput != "" {
+			m.filterInput = ""
+			m.cursor = 0
+			m.addOperationLog("Filter cleared")
+			m.updateViewport()
+		}
+
 	case key.Matches(msg, keys.Tab):
-		m.currentTab = (m.currentTab + 1) % 4 // Now we have 4 tabs
+		m.currentTab = (m.currentTab + 1) % tabCount
 		m.cursor = 0
+		m.viewport.GotoTop()
+		m.updateViewport()
+
+	case key.Matches(msg, keys.ShiftTab):
+		m.currentTab = (m.currentTab + tabCount - 1) % tabCount
+		m.cursor = 0
+		m.viewport.GotoTop()
 		m.updateViewport()
 
 	case key.Matches(msg, keys.Filter):
 		m.filterMode = true
 		m.filterInput = ""
-		m.addOperationLog("Filter mode - type to search")
+		m.cursor = 0
+		m.addOperationLog("Filter mode - type to search, Enter to apply")
+		m.updateViewport()
+
+	case key.Matches(msg, keys.SelectAll):
+		if canSelect {
+			m.toggleAllVisible()
+		}
 
 	case key.Matches(msg, keys.Space):
-		if canSelect && len(m.updateModules) > 0 && m.cursor < len(m.updateModules) {
-			// Check if this module has been updated
-			visibleModules := m.getVisibleUpdateModules()
-			if m.cursor >= len(visibleModules) {
+		if canSelect {
+			visible := m.getVisibleUpdateModules()
+			if m.cursor < 0 || m.cursor >= len(visible) {
 				return m, nil
 			}
-			actualIdx := visibleModules[m.cursor]
+			actualIdx := visible[m.cursor]
+			mod := m.updateModules[actualIdx]
 
-			if m.updateModules[actualIdx].Updated {
-				// Already updated, cannot select
-				m.addOperationLog(fmt.Sprintf("Already updated: %s", m.updateModules[actualIdx].Info.Path))
+			if mod.Updated {
+				m.addOperationLog(fmt.Sprintf("Already updated: %s", mod.Info.Path))
 				return m, nil
 			}
 
-			// Update tab: toggle selection
-			m.updateModules[actualIdx].Selected = !m.updateModules[actualIdx].Selected
+			mod.Selected = !mod.Selected
 			status := "selected"
-			if !m.updateModules[actualIdx].Selected {
+			if !mod.Selected {
 				status = "deselected"
 			}
-			m.addOperationLog(fmt.Sprintf("%s: %s", status, m.updateModules[actualIdx].Info.Path))
+			m.addOperationLog(fmt.Sprintf("%s: %s", status, mod.Info.Path))
 			m.updateViewport()
 		} else {
-			// Read-only tabs: show detail popup
-			m.detailContent = m.getDetailContent()
-
-			if len(m.detailContent) == 0 {
-				// Skip logging for empty details
+			header, ok := m.detailHeader()
+			if !ok {
 				return m, nil
 			}
 
+			// Render the header immediately and fill in the slow part when it
+			// arrives, so opening a popup never blocks the event loop.
+			load := m.loadDetailBody()
+			m.detailModule = m.detailSubject()
+			m.detailContent = header
+			if load != nil {
+				m.detailContent += detailLoadingNotice
+			}
 			m.showingDetail = true
 
-			// Initialize detail viewport with content
-			// Leave enough space for border (2) and padding (4)
-			popupWidth := min(m.width-10, 80)
-			popupHeight := min(m.height-10, 30)
-			viewportWidth := popupWidth - 6   // Border (2) + Padding (4)
-			viewportHeight := popupHeight - 4 // Border (2) + Padding (2)
-
-			m.detailViewport = viewport.New(viewportWidth, viewportHeight)
+			// Match renderDetailPopup's geometry: border (2) + horizontal
+			// padding (4), border (2) + vertical padding (2), plus one line
+			// for the help text below the box.
+			w, h := m.detailViewportSize()
+			m.detailViewport = viewport.New(w, h)
 			m.detailViewport.SetContent(m.detailContent)
+
+			return m, m.loadDetailBody()
 		}
 
 	case key.Matches(msg, keys.Up):
@@ -526,8 +640,7 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case key.Matches(msg, keys.Down):
-		maxCursor := m.getMaxCursor()
-		if m.cursor < maxCursor {
+		if m.cursor < m.getMaxCursor() {
 			m.cursor++
 			m.updateViewport()
 			m.syncViewportToCursor()
@@ -539,13 +652,59 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.syncViewportToCursor()
 
 	case key.Matches(msg, keys.PageDown):
-		maxCursor := m.getMaxCursor()
-		m.cursor = min(maxCursor, m.cursor+10)
+		// max(0, …) matters on an empty tab, where getMaxCursor() is -1: a
+		// cursor of -1 sticks (Up needs >0, Down needs <-1) and would index
+		// out of range if any consumer trusted it.
+		m.cursor = max(0, min(m.getMaxCursor(), m.cursor+10))
+		m.updateViewport()
+		m.syncViewportToCursor()
+
+	case key.Matches(msg, keys.Home):
+		m.cursor = 0
+		m.updateViewport()
+		m.syncViewportToCursor()
+
+	case key.Matches(msg, keys.End):
+		m.cursor = max(0, m.getMaxCursor())
 		m.updateViewport()
 		m.syncViewportToCursor()
 	}
 
 	return m, nil
+}
+
+// toggleAllVisible selects every filtered, not-yet-updated module — or clears
+// them all if any are already selected, so the key is its own undo.
+func (m *AppModel) toggleAllVisible() {
+	visible := m.getVisibleUpdateModules()
+
+	anySelected := false
+	for _, idx := range visible {
+		if m.updateModules[idx].Selected {
+			anySelected = true
+			break
+		}
+	}
+
+	changed := 0
+	for _, idx := range visible {
+		mod := m.updateModules[idx]
+		if mod.Updated {
+			continue
+		}
+		if mod.Selected == !anySelected {
+			continue
+		}
+		mod.Selected = !anySelected
+		changed++
+	}
+
+	if anySelected {
+		m.addOperationLog(fmt.Sprintf("Deselected %d module(s)", changed))
+	} else {
+		m.addOperationLog(fmt.Sprintf("Selected %d module(s)", changed))
+	}
+	m.updateViewport()
 }
 
 func (m AppModel) handleFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -559,19 +718,32 @@ func (m AppModel) handleFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "enter":
 		m.filterMode = false
-		m.addOperationLog(fmt.Sprintf("Filter: '%s'", m.filterInput))
+		if m.filterInput == "" {
+			m.addOperationLog("Filter cleared")
+		} else {
+			m.addOperationLog(fmt.Sprintf("Filter: '%s'", m.filterInput))
+		}
 		m.cursor = 0
 		m.updateViewport()
 
 	case "backspace":
-		if len(m.filterInput) > 0 {
-			m.filterInput = m.filterInput[:len(m.filterInput)-1]
+		if m.filterInput != "" {
+			// Trim a whole rune: module paths can contain multi-byte
+			// characters, and lopping off a single byte would corrupt them.
+			runes := []rune(m.filterInput)
+			m.filterInput = string(runes[:len(runes)-1])
+			m.cursor = 0
 			m.updateViewport()
 		}
 
 	default:
-		if len(msg.String()) == 1 {
-			m.filterInput += msg.String()
+		if msg.Type == tea.KeyRunes {
+			m.filterInput += string(msg.Runes)
+			m.cursor = 0
+			m.updateViewport()
+		} else if msg.Type == tea.KeySpace {
+			m.filterInput += " "
+			m.cursor = 0
 			m.updateViewport()
 		}
 	}
