@@ -25,10 +25,9 @@ echo "Test 4: Non-existent directory (should error)"
 ./go-mod-select 1.25 --dir /nonexistent/path 2>&1 | grep -i "error\|not found"
 echo ""
 
-# Test 5: Priority test - both --dir and --gomod (gomod should win)
-echo "Test 5: Priority test - both flags (gomod should win)"
-echo "Using: --dir /tmp --gomod ./go.mod"
-./go-mod-select 1.25 --dir /tmp --gomod ./go.mod --dry-run 2>&1 | head -5
+# Test 5: --dir and --gomod are mutually exclusive (should error)
+echo "Test 5: Both --dir and --gomod (should be rejected)"
+./go-mod-select 1.25 --dir /tmp --gomod ./go.mod --dry-run 2>&1 | head -3
 echo ""
 
 echo "=============================================="
