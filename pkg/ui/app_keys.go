@@ -13,6 +13,7 @@ type keyMap struct {
 	ShiftTab  key.Binding
 	Filter    key.Binding
 	SelectAll key.Binding
+	Verify    key.Binding
 	Esc       key.Binding
 	Quit      key.Binding
 	ForceQuit key.Binding
@@ -60,6 +61,10 @@ var keys = keyMap{
 	SelectAll: key.NewBinding(
 		key.WithKeys("a"),
 		key.WithHelp("a", "select all"),
+	),
+	Verify: key.NewBinding(
+		key.WithKeys("v"),
+		key.WithHelp("v", "build check"),
 	),
 	Esc: key.NewBinding(
 		key.WithKeys("esc"),

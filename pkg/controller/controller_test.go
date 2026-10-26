@@ -32,3 +32,15 @@ func TestUpdateFailureWording(t *testing.T) {
 		t.Errorf("ordinary failure: %s", got)
 	}
 }
+
+func TestUpdateFailureForABrokenBuild(t *testing.T) {
+	err := fmt.Errorf("%w: go build: exit status 1", updater.ErrVerifyFailed)
+
+	got := updateFailure(err).Error()
+	if !strings.Contains(got, "no longer builds") || !strings.Contains(got, "restored") {
+		t.Errorf("message should say the build broke and the update was rolled back: %s", got)
+	}
+	if !errors.Is(updateFailure(err), updater.ErrVerifyFailed) {
+		t.Error("the cause should stay matchable")
+	}
+}

@@ -21,6 +21,7 @@ var (
 	workDir        string
 	autoSelect     bool
 	allowDowngrade bool
+	verify         bool
 )
 
 var rootCmd = &cobra.Command{
@@ -42,6 +43,7 @@ Usage examples:
   go-mod-select 1.25 --gomod /path/to/go.mod  # Use specified go.mod file
   go-mod-select 1.25 --dry-run                # Print the plan, change nothing
   go-mod-select 1.25 --auto                   # Apply everything without prompting
+  go-mod-select 1.25 --auto --verify          # ...and roll back if the project stops building
   go-mod-select 1.25 --verbose                # Pass through go get output`,
 	Args:          cobra.MaximumNArgs(1),
 	RunE:          run,
@@ -58,7 +60,10 @@ func init() {
 	rootCmd.Flags().BoolVar(&autoSelect, "auto", false, "Automatically select and apply all compatible updates")
 	rootCmd.Flags().BoolVar(&allowDowngrade, "allow-downgrade", false,
 		"In --auto mode, also apply versions older than the current one when the current version needs a newer Go")
+	rootCmd.Flags().BoolVar(&verify, "verify", false,
+		"After updating, run go build ./... and roll everything back if the project no longer builds (skipped if it did not build before)")
 	rootCmd.MarkFlagsMutuallyExclusive("gomod", "dir")
+	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "verify")
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "auto")
 }
 
@@ -123,6 +128,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Verbose:         verbose,
 		AutoSelect:      autoSelect,
 		AllowDowngrade:  allowDowngrade,
+		Verify:          verify,
 	}
 
 	logger.Log.Info("starting controller",

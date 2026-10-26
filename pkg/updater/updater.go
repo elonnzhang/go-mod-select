@@ -23,6 +23,14 @@ type ProgressCallback func(current, total int, module, status string)
 // `go mod tidy` step. Callers match on it to render that step differently.
 const TidyLabel = "go mod tidy"
 
+// VerifyLabel is the step name reported to the progress callback for the build
+// check, alongside TidyLabel: neither is a per-module step.
+const VerifyLabel = "go build ./..."
+
+// ErrVerifyFailed marks a run that was rolled back because the project no
+// longer built after the update.
+var ErrVerifyFailed = errors.New("build verification failed")
+
 // ErrCancelled is returned (wrapped) when the context given to WithContext is
 // cancelled mid-run. By the time it is returned both module files have already
 // been restored.
@@ -40,6 +48,10 @@ const interruptGrace = 5 * time.Second
 type Updater struct {
 	goMod   *parser.GoMod
 	workDir string
+
+	// verify makes the run check that the project still builds, and roll back
+	// if it does not. See WithVerify.
+	verify bool
 
 	// ctx, when set, aborts the run: the go subprocess in flight is interrupted
 	// and no further step starts.
@@ -108,6 +120,43 @@ func (u *Updater) goSumPath() string {
 func (u *Updater) WithContext(ctx context.Context) *Updater {
 	u.ctx = ctx
 	return u
+}
+
+// WithVerify makes UpdateAll* run `go build ./...` after the update and roll
+// back if the project no longer builds.
+//
+// A build is only a fair judge if the project built before: one that was already
+// broken would fail the check whatever was updated, and every update would be
+// rolled back for a reason that has nothing to do with it. So the build runs once
+// before any change, and the post-update check is skipped (with a notice) when
+// that baseline fails. Tests are not run.
+func (u *Updater) WithVerify() *Updater {
+	u.verify = true
+	return u
+}
+
+// baselineBuilds reports whether the project builds as it stands. A failure is
+// not an error of the run; only cancellation is returned as one.
+func (u *Updater) baselineBuilds(verbose bool) (bool, error) {
+	if err := u.runGo(verbose, "build", "./..."); err != nil {
+		if errors.Is(err, ErrCancelled) {
+			return false, err
+		}
+		logger.Log.Warn("project does not build before the update; build check skipped", "error", err.Error())
+		return false, nil
+	}
+	return true, nil
+}
+
+// verifyBuild checks the project still builds after the update.
+func (u *Updater) verifyBuild(verbose bool) error {
+	if err := u.runGo(verbose, "build", "./..."); err != nil {
+		if errors.Is(err, ErrCancelled) {
+			return err
+		}
+		return fmt.Errorf("%w: %w", ErrVerifyFailed, err)
+	}
+	return nil
 }
 
 // cancelled reports whether the run's context has been cancelled.
@@ -343,6 +392,25 @@ func (u *Updater) applyGoVersion(targetGoVersion string) error {
 
 // UpdateAllWithProgress performs a complete update with progress reporting
 func (u *Updater) UpdateAllWithProgress(targetGoVersion string, modules []*finder.ModuleInfo, verbose bool, progressCb ProgressCallback) error {
+	notify := func(status string) {
+		if progressCb != nil {
+			progressCb(0, 0, VerifyLabel, status)
+		}
+	}
+
+	verify := false
+	if u.verify {
+		notify("checking")
+		ok, err := u.baselineBuilds(verbose)
+		if err != nil {
+			return err // cancelled before anything was changed
+		}
+		verify = ok
+		if !ok {
+			notify("skipped")
+		}
+	}
+
 	if err := u.applyGoVersion(targetGoVersion); err != nil {
 		return u.rollbackOn(err)
 	}
@@ -355,11 +423,35 @@ func (u *Updater) UpdateAllWithProgress(targetGoVersion string, modules []*finde
 		return u.rollbackOn(err)
 	}
 
+	if verify {
+		notify("verifying")
+		if err := u.verifyBuild(verbose); err != nil {
+			if !errors.Is(err, ErrCancelled) {
+				notify("error")
+			}
+			return u.rollbackOn(err)
+		}
+		notify("success")
+	}
+
 	return nil
 }
 
 // UpdateAll performs a complete update: Go version + modules + tidy
 func (u *Updater) UpdateAll(targetGoVersion string, modules []*finder.ModuleInfo, verbose bool) error {
+	verify := false
+	if u.verify {
+		fmt.Println("\n[INFO] Checking that the project builds before the update...")
+		ok, err := u.baselineBuilds(verbose)
+		if err != nil {
+			return err // cancelled before anything was changed
+		}
+		verify = ok
+		if !ok {
+			fmt.Println("[WARN] The project does not build as it stands, so the post-update build check is skipped.")
+		}
+	}
+
 	if err := u.applyGoVersion(targetGoVersion); err != nil {
 		return u.rollbackOn(err)
 	}
@@ -370,6 +462,14 @@ func (u *Updater) UpdateAll(targetGoVersion string, modules []*finder.ModuleInfo
 
 	if err := u.Tidy(verbose); err != nil {
 		return u.rollbackOn(err)
+	}
+
+	if verify {
+		fmt.Println("\n[INFO] Verifying the project still builds...")
+		if err := u.verifyBuild(verbose); err != nil {
+			return u.rollbackOn(err)
+		}
+		fmt.Println("[INFO] ✓ go build ./... succeeded")
 	}
 
 	return nil

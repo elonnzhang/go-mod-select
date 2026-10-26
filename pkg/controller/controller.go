@@ -26,6 +26,9 @@ type Config struct {
 	// AllowDowngrade lets auto mode apply a version older than the current one
 	// when the current version requires a newer Go than the target.
 	AllowDowngrade bool
+	// Verify checks that the project still builds after an update and rolls the
+	// update back if it does not.
+	Verify bool
 }
 
 // Run executes the main logic of go-mod-select
@@ -55,7 +58,7 @@ func Run(cfg *Config) error {
 	// The TUI performs the update itself on its updating screen. It used to
 	// also hand the selection back for the caller to apply, which ran every
 	// `go get` a second time.
-	return ui.TUI(cfg.TargetGoVersion, goMod, projectRoot)
+	return ui.TUI(cfg.TargetGoVersion, goMod, projectRoot, ui.Options{Verify: cfg.Verify})
 }
 
 // errInterrupted ends a command-line run the user cancelled.
@@ -105,6 +108,8 @@ func updateFailure(err error) error {
 	switch {
 	case errors.Is(err, updater.ErrRollbackFailed):
 		return fmt.Errorf("update failed and the rollback was incomplete; inspect go.mod and go.sum (e.g. git diff): %w", err)
+	case errors.Is(err, updater.ErrVerifyFailed):
+		return fmt.Errorf("the project no longer builds after the update, so it was rolled back (go.mod and go.sum restored): %w", err)
 	case errors.Is(err, updater.ErrCancelled):
 		return errors.New("interrupted (go.mod and go.sum restored)")
 	default:
@@ -199,6 +204,9 @@ func runAutoMode(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectR
 	}
 
 	upd := updater.NewUpdater(goMod).WithContext(ctx)
+	if cfg.Verify {
+		upd.WithVerify()
+	}
 	if err := upd.UpdateAll(cfg.TargetGoVersion, apply, cfg.Verbose); err != nil {
 		return updateFailure(err)
 	}

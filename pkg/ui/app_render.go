@@ -2,12 +2,14 @@ package ui
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"strings"
 	"unicode/utf8"
 
 	"go-mod-select/pkg/finder"
 	"go-mod-select/pkg/parser"
+	"go-mod-select/pkg/updater"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -145,7 +147,11 @@ func (m AppModel) selectionHint() string {
 		}
 	case m.currentTab == tabUpdate:
 		sel := fmt.Sprintf("Selected: %d/%d", m.countSelected(), len(m.updateModules))
+		if m.verify {
+			sel += " | build check on"
+		}
 		variants = []string{
+			"↑↓ move | Space toggle | a all | v build check | Tab switch | / filter | Enter update | " + sel,
 			"↑↓ move | Space toggle | a all | Tab switch | / filter | Enter update | " + sel,
 			"↑↓ move | Space toggle | a all | / filter | Enter update | " + sel,
 			"Space toggle | a all | / filter | Enter update | " + sel,
@@ -279,6 +285,10 @@ func (m AppModel) renderUpdating() string {
 			status = fmt.Sprintf("%d/%d modules done — running go mod tidy\n\n",
 				m.currentModule, m.totalModules)
 		}
+		if m.verifyRunning {
+			status = fmt.Sprintf("%d/%d modules done — verifying the project still builds\n\n",
+				m.currentModule, m.totalModules)
+		}
 		status += progressBar
 
 		statusBox := lipgloss.NewStyle().
@@ -372,6 +382,9 @@ func (m AppModel) renderComplete() string {
 		heading = "Update Failed — changes rolled back"
 		if wasCancelled(m.updateError) {
 			heading = "Update Cancelled — changes rolled back"
+		}
+		if errors.Is(m.updateError, updater.ErrVerifyFailed) {
+			heading = "Build Check Failed — changes rolled back"
 		}
 		if !rolledBack(m.updateError) {
 			heading = "Update Failed — ROLLBACK INCOMPLETE"

@@ -95,6 +95,8 @@ type AppModel struct {
 	updatedBefore      map[string]bool // modules already applied when this run started; a rollback must not un-apply them
 	tidySucceeded      bool            // go mod tidy reported success in this update run
 	tidyRunning        bool            // go mod tidy is in flight (not a per-module step)
+	verify             bool            // check that the project still builds after the update, and roll back if not
+	verifyRunning      bool            // that build check is in flight
 	updateFailed       bool            // at least one step of the update run failed
 	updateError        error           // why the update run failed, if it did
 	actualGoVersion    string          // go directive found on disk after the update
@@ -183,10 +185,17 @@ type startUpdateMsg struct {
 	modules         []*finder.ModuleInfo
 	targetGoVersion string
 	goMod           *parser.GoMod
+	verify          bool
+}
+
+// Options are the settings the command line hands to the interface.
+type Options struct {
+	// Verify starts with the post-update build check on; `v` toggles it.
+	Verify bool
 }
 
 // InitialAppModel creates a new AppModel with default values
-func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot string) AppModel {
+func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot string, opts Options) AppModel {
 	// A broken or unwritable theme file degrades to the defaults rather than
 	// failing the run; LoadOrCreateDefault returns a usable config either way.
 	colors, err := config.LoadOrCreateDefault()
@@ -212,6 +221,7 @@ func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot st
 		targetGoVersion: targetGoVersion,
 		goMod:           goMod,
 		projectRoot:     projectRoot,
+		verify:          opts.Verify,
 		colors:          colors,
 		styles:          newStyleSet(colors),
 		spinner:         s,
@@ -314,6 +324,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case updateProgressMsg:
 		isTidy := msg.module == updater.TidyLabel
+
+		if msg.module == updater.VerifyLabel {
+			m.handleVerifyProgress(msg.status)
+			if m.updateSub != nil {
+				return m, waitForUpdateMsg(m.updateSub)
+			}
+			return m, nil
+		}
 
 		// The tidy step reports 0/0 because it is not per-module. Assigning
 		// that would zero the counters and hide the progress bar during the
@@ -623,6 +641,7 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.updateLogs = nil
 			m.tidySucceeded = false
 			m.tidyRunning = false
+			m.verifyRunning = false
 			m.updateFailed = false
 			m.updateError = nil
 			m.currentModule = 0
@@ -654,6 +673,16 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.SelectAll):
 		if canSelect {
 			m.toggleAllVisible()
+		}
+
+	case key.Matches(msg, keys.Verify):
+		if canSelect {
+			m.verify = !m.verify
+			if m.verify {
+				m.addOperationLog("Build check on: go build ./... runs after the update; a failure rolls everything back")
+			} else {
+				m.addOperationLog("Build check off")
+			}
 		}
 
 	case key.Matches(msg, keys.Space):

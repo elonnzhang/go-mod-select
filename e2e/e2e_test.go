@@ -110,8 +110,22 @@ func newSandbox(t *testing.T, proxy *fakeProxy, deps ...string) *sandbox {
 		"GOTOOLCHAIN=local",
 		"GOFLAGS=",
 	)
+
+	// A real project has a go.sum. Without one `go build` fails on every
+	// dependency, which would make the build baseline meaningless.
+	tidy := exec.Command("go", "mod", "tidy")
+	tidy.Dir = sb.dir
+	tidy.Env = sb.env
+	if out, err := tidy.CombinedOutput(); err != nil {
+		t.Fatalf("go mod tidy in the fixture: %v\n%s", err, out)
+	}
 	return sb
 }
+
+// files is the pair of module files an update rewrites.
+type files struct{ mod, sum string }
+
+func (sb *sandbox) snapshot() files { return files{sb.read("go.mod"), sb.read("go.sum")} }
 
 func (sb *sandbox) write(name, content string) {
 	sb.t.Helper()
@@ -153,7 +167,7 @@ func (sb *sandbox) scratchDirs() []string {
 // twoReleases publishes v1.0.0 and v1.1.0 of each module, both for go 1.21.
 func twoReleases(p *fakeProxy, modules ...string) {
 	for _, m := range modules {
-		p.publish(m, release{"v1.0.0", "1.21"}, release{"v1.1.0", "1.21"})
+		p.publish(m, release{version: "v1.0.0", goDir: "1.21"}, release{version: "v1.1.0", goDir: "1.21"})
 	}
 }
 

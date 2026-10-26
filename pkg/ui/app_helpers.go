@@ -560,6 +560,7 @@ func (m AppModel) performUpdate() tea.Cmd {
 			modules:         selected,
 			targetGoVersion: m.targetGoVersion,
 			goMod:           m.goMod,
+			verify:          m.verify,
 		}
 	}
 }
@@ -615,6 +616,9 @@ func startUpdateWorker(ctx context.Context, cancel context.CancelFunc, msg start
 	}()
 
 	upd = updater.NewUpdater(msg.goMod).WithContext(ctx)
+	if msg.verify {
+		upd.WithVerify()
+	}
 
 	progressCb := func(current, total int, module, status string) {
 		send(sub, done, updateProgressMsg{
@@ -708,6 +712,30 @@ func (m AppModel) reasonText() string {
 	return strings.Join(errorLines(m.updateError, 8, max(m.width-16, 20)), "\n        ")
 }
 
+// handleVerifyProgress logs a step of the post-update build check.
+func (m *AppModel) handleVerifyProgress(status string) {
+	var entry string
+	switch status {
+	case "checking":
+		entry = "⏳ Checking that the project builds before the update…"
+	case "skipped":
+		entry = "- Build check skipped: the project does not build as it stands"
+	case "verifying":
+		entry = "⏳ Verifying `go build ./...`…"
+		m.verifyRunning = true
+	case "success":
+		entry = "✓ The project still builds"
+		m.verifyRunning = false
+	case "error":
+		entry = "✗ The project no longer builds after the update"
+		m.verifyRunning = false
+		m.updateFailed = true
+	}
+	if entry != "" {
+		m.updateLogs = append(m.updateLogs, entry)
+	}
+}
+
 // wasCancelled reports whether an update run ended because the user cancelled.
 func wasCancelled(err error) bool { return errors.Is(err, updater.ErrCancelled) }
 
@@ -748,8 +776,8 @@ func waitWorkers(wg *sync.WaitGroup, grace time.Duration) {
 // It deliberately returns no module list: it used to hand back the selected
 // modules, and the caller applied them a second time on top of the update the
 // TUI had already performed.
-func TUI(targetGoVersion string, goMod *parser.GoMod, projectRoot string) error {
-	m := InitialAppModel(targetGoVersion, goMod, projectRoot)
+func TUI(targetGoVersion string, goMod *parser.GoMod, projectRoot string, opts Options) error {
+	m := InitialAppModel(targetGoVersion, goMod, projectRoot, opts)
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 

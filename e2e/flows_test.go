@@ -60,8 +60,8 @@ func TestDryRunListsAvailableUpdates(t *testing.T) {
 func TestReleasesNeedingANewerGoAreNeverProposed(t *testing.T) {
 	p := newFakeProxy(t)
 	p.publish("example.com/dep1",
-		release{"v0.9.0", "1.21"}, release{"v1.0.0", "1.21"},
-		release{"v1.1.0", "1.99"}, release{"v1.2.0", "1.99"})
+		release{version: "v0.9.0", goDir: "1.21"}, release{version: "v1.0.0", goDir: "1.21"},
+		release{version: "v1.1.0", goDir: "1.99"}, release{version: "v1.2.0", goDir: "1.99"})
 	sb := newSandbox(t, p, "example.com/dep1")
 	sb.write("go.mod", strings.Replace(sb.read("go.mod"), "dep1 v1.0.0", "dep1 v0.9.0", 1))
 
@@ -123,8 +123,8 @@ func TestFilterSelectUpdateAndReturn(t *testing.T) {
 func TestQuitDuringAnalysisLeavesNothingBehind(t *testing.T) {
 	p := newFakeProxy(t)
 	twoReleases(p, "example.com/dep1", "example.com/dep2", "example.com/dep3")
-	p.delay("*", 700*time.Millisecond)
 	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2", "example.com/dep3")
+	p.delay("*", 700*time.Millisecond)
 	tm := sb.tui()
 
 	tm.expect("Press Enter")
@@ -148,12 +148,12 @@ func TestQuitDuringAnalysisLeavesNothingBehind(t *testing.T) {
 }
 
 // updateInFlight walks to the point where go get is blocked downloading a zip.
-func updateInFlight(t *testing.T) (*sandbox, *term, string) {
+func updateInFlight(t *testing.T) (*sandbox, *term, files) {
 	p := newFakeProxy(t)
 	twoReleases(p, "example.com/dep1", "example.com/dep2", "example.com/dep3")
 	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2", "example.com/dep3")
 	sb.target = "1.22"
-	original := sb.read("go.mod")
+	original := sb.snapshot()
 	tm := sb.tui()
 
 	startAnalysis(tm)
@@ -166,13 +166,14 @@ func updateInFlight(t *testing.T) (*sandbox, *term, string) {
 	return sb, tm, original
 }
 
-func assertRolledBack(t *testing.T, sb *sandbox, original string) {
+func assertRolledBack(t *testing.T, sb *sandbox, want files) {
 	t.Helper()
-	if got := sb.read("go.mod"); got != original {
-		t.Errorf("go.mod was left modified:\n%s", got)
+	got := sb.snapshot()
+	if got.mod != want.mod {
+		t.Errorf("go.mod was left modified:\n%s", got.mod)
 	}
-	if sum := sb.read("go.sum"); sum != "" {
-		t.Errorf("a go.sum that did not exist before was left behind:\n%s", sum)
+	if got.sum != want.sum {
+		t.Errorf("go.sum was left modified:\n%s", got.sum)
 	}
 }
 
@@ -241,8 +242,9 @@ func TestAutoModeInterruptedMidUpdateRollsBack(t *testing.T) {
 	twoReleases(p, "example.com/dep1", "example.com/dep2")
 	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2")
 	sb.target = "1.22"
-	original := sb.read("go.mod")
+	original := sb.snapshot()
 	p.delay("zip", 20*time.Second)
+	p.resetHits()
 
 	run := sb.startCLI("--auto")
 	p.waitForHit(t, "zip") // go get is now blocked downloading
@@ -259,8 +261,9 @@ func TestAutoModeInterruptedMidUpdateRollsBack(t *testing.T) {
 func TestDryRunInterruptedMidAnalysisLeavesNothingBehind(t *testing.T) {
 	p := newFakeProxy(t)
 	twoReleases(p, "example.com/dep1", "example.com/dep2")
-	p.delay("*", 20*time.Second)
 	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2")
+	p.delay("*", 20*time.Second)
+	p.resetHits()
 
 	run := sb.startCLI("--dry-run")
 	p.waitForHit(t, "list")
@@ -284,7 +287,7 @@ func TestDryRunNamesModulesItCouldNotAnalyze(t *testing.T) {
 	p := newFakeProxy(t)
 	twoReleases(p, "example.com/dep1")
 	sb := newSandbox(t, p, "example.com/dep1")
-	sb.write("go.mod", strings.Replace(sb.read("go.mod"), ")\n", "\texample.com/ghost v1.0.0\n)\n", 1))
+	sb.write("go.mod", sb.read("go.mod")+"\nrequire example.com/ghost v1.0.0\n")
 
 	out, err := sb.run("--dry-run")
 	if err != nil {
@@ -295,5 +298,97 @@ func TestDryRunNamesModulesItCouldNotAnalyze(t *testing.T) {
 	}
 	if !strings.Contains(out, "1 module(s) could not be analyzed") || !strings.Contains(out, "example.com/ghost") {
 		t.Errorf("the failed lookup should be named:\n%s", out)
+	}
+}
+
+// breakingDep publishes a dependency whose newer release drops the function the
+// application calls: the update applies cleanly and the project stops building.
+func breakingDep(p *fakeProxy) {
+	p.publish("example.com/dep1",
+		release{version: "v1.0.0", goDir: "1.21", source: "package dep1\n\nfunc Hello() {}\n"},
+		release{version: "v1.1.0", goDir: "1.21", source: "package dep1\n"})
+}
+
+const callsHello = "package main\n\nimport \"example.com/dep1\"\n\nfunc main() { dep1.Hello() }\n"
+
+func TestVerifyRollsBackAnUpdateThatBreaksTheBuild(t *testing.T) {
+	p := newFakeProxy(t)
+	breakingDep(p)
+	twoReleases(p, "example.com/dep2")
+	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2")
+	sb.write("main.go", callsHello)
+	sb.target = "1.22"
+	original := sb.snapshot()
+
+	out, err := sb.run("--auto", "--verify")
+
+	if err == nil || !strings.Contains(out, "no longer builds") {
+		t.Errorf("want a failure saying the project no longer builds (err=%v):\n%s", err, out)
+	}
+	// dep2's harmless update is undone as well: the run is all or nothing.
+	assertRolledBack(t, sb, original)
+}
+
+func TestVerifyKeepsAnUpdateThatStillBuilds(t *testing.T) {
+	p := newFakeProxy(t)
+	twoReleases(p, "example.com/dep1", "example.com/dep2")
+	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2")
+
+	out, err := sb.run("--auto", "--verify")
+
+	if err != nil {
+		t.Fatalf("a good update was rejected: %v\n%s", err, out)
+	}
+	if got := sb.read("go.mod"); !strings.Contains(got, "example.com/dep1 v1.1.0") || !strings.Contains(got, "example.com/dep2 v1.1.0") {
+		t.Errorf("the update was not applied:\n%s", got)
+	}
+	if !strings.Contains(out, "go build ./... succeeded") {
+		t.Errorf("the build check should have run:\n%s", out)
+	}
+}
+
+// A project that did not build to begin with would fail every check, so the
+// check must stand down rather than roll back every update.
+func TestVerifyStandsDownWhenTheProjectAlreadyFailedToBuild(t *testing.T) {
+	p := newFakeProxy(t)
+	twoReleases(p, "example.com/dep1")
+	sb := newSandbox(t, p, "example.com/dep1")
+	// Still imports dep1, or go mod tidy would drop the requirement.
+	sb.write("main.go", "package main\n\nimport _ \"example.com/dep1\"\n\nfunc main() { undefined() }\n")
+
+	out, err := sb.run("--auto", "--verify")
+
+	if err != nil {
+		t.Fatalf("update should proceed when the baseline build already fails: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "does not build as it stands") {
+		t.Errorf("the skipped check should be announced:\n%s", out)
+	}
+	if !strings.Contains(sb.read("go.mod"), "example.com/dep1 v1.1.0") {
+		t.Error("the update was not applied")
+	}
+}
+
+func TestVerifyToggleInTheTUIRollsBackABreakingUpdate(t *testing.T) {
+	p := newFakeProxy(t)
+	breakingDep(p)
+	sb := newSandbox(t, p, "example.com/dep1")
+	sb.write("main.go", callsHello)
+	sb.target = "1.22"
+	original := sb.snapshot()
+	tm := sb.tui()
+
+	startAnalysis(tm)
+	tm.send("v")
+	tm.expect("Build check on")
+	tm.send("a")
+	tm.expect("Selected 1 module(s)")
+	tm.send("\r")
+	tm.expect("Build Check Failed")
+
+	assertRolledBack(t, sb, original)
+	tm.send("q")
+	if code := tm.wait(quick); code != 0 {
+		t.Errorf("exit code %d", code)
 	}
 }

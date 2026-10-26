@@ -328,3 +328,65 @@ func TestUpdateWorkerPanicRollsBack(t *testing.T) {
 		t.Errorf("go.mod left half-updated after a panic:\n%s", got)
 	}
 }
+
+func TestVerifyKeyTogglesTheBuildCheckOnTheUpdateTab(t *testing.T) {
+	m := sized(semverModel(3), 120, 40)
+
+	m = press(m, keyRunes("v"))
+	if !m.verify {
+		t.Fatal("v should turn the build check on")
+	}
+	if hint := m.selectionHint(); !strings.Contains(hint, "build check on") {
+		t.Errorf("the hint should show the state: %q", hint)
+	}
+	m = press(m, keyRunes("v"))
+	if m.verify {
+		t.Error("v again should turn it off")
+	}
+
+	// It belongs to updating, so it does nothing where Enter cannot update.
+	m = press(m, keyType(tea.KeyTab))
+	if m = press(m, keyRunes("v")); m.verify {
+		t.Error("v toggled the build check on a read-only tab")
+	}
+
+	// And while typing a filter it is just a letter.
+	m = press(m, keyType(tea.KeyShiftTab))
+	m = press(m, keyRunes("/"))
+	if m = typeText(m, "v"); m.verify || m.filterInput != "v" {
+		t.Errorf("v in the filter: verify=%v filter=%q", m.verify, m.filterInput)
+	}
+}
+
+func TestBuildCheckProgressIsShownAndAFailureFailsTheRun(t *testing.T) {
+	m := sized(semverModel(1), 120, 40)
+	m.currentScreen = screenUpdating
+	m.totalModules, m.currentModule = 1, 1
+
+	step := func(status string) {
+		model, _ := m.Update(updateProgressMsg{module: updater.VerifyLabel, status: status})
+		m = model.(AppModel)
+	}
+
+	step("verifying")
+	if !m.verifyRunning || !strings.Contains(m.renderUpdating(), "verifying the project still builds") {
+		t.Error("the updating screen should say the build check is running")
+	}
+	if m.currentModule != 1 || m.totalModules != 1 {
+		t.Errorf("the check is not a per-module step; counters became %d/%d", m.currentModule, m.totalModules)
+	}
+
+	step("error")
+	if m.verifyRunning || !m.updateFailed {
+		t.Errorf("a failed check should end the step and fail the run (running=%v failed=%v)", m.verifyRunning, m.updateFailed)
+	}
+	if last := m.updateLogs[len(m.updateLogs)-1]; !strings.Contains(last, "no longer builds") {
+		t.Errorf("log should say why: %q", last)
+	}
+
+	m.currentScreen = screenComplete
+	m.updateError = fmt.Errorf("%w: go build: exit status 1", updater.ErrVerifyFailed)
+	if view := m.renderComplete(); !strings.Contains(view, "Build Check Failed") {
+		t.Errorf("the summary should name the build check:\n%s", view)
+	}
+}

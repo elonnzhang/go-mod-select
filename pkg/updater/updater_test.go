@@ -370,3 +370,108 @@ func TestInterruptedStepReportsNoErrorStatus(t *testing.T) {
 		t.Errorf("statuses = %v, want only [updating]", statuses)
 	}
 }
+
+const buildableMain = "package main\n\nfunc main() {}\n"
+
+// buildModule is a dependency-free module, so `go build ./...` works offline.
+func buildModule(t *testing.T, mainSrc string) (dir string, gm *parser.GoMod) {
+	t.Helper()
+	t.Setenv("GOFLAGS", "")
+	t.Setenv("GOTOOLCHAIN", "local")
+
+	dir = t.TempDir()
+	modPath := filepath.Join(dir, "go.mod")
+	if err := os.WriteFile(modPath, []byte("module example.com/v\n\ngo 1.21\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(mainSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gm, err := parser.ParseGoMod(modPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir, gm
+}
+
+// verifySteps collects the statuses reported for the build check.
+func verifySteps(steps *[]string) ProgressCallback {
+	return func(_, _ int, module, status string) {
+		if module == VerifyLabel {
+			*steps = append(*steps, status)
+		}
+	}
+}
+
+func TestVerifyChecksTheBuildBeforeAndAfter(t *testing.T) {
+	_, gm := buildModule(t, buildableMain)
+	var steps []string
+
+	err := NewUpdater(gm).WithVerify().UpdateAllWithProgress("1.21", nil, false, verifySteps(&steps))
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(steps, ","); got != "checking,verifying,success" {
+		t.Errorf("build check steps = %s, want checking,verifying,success", got)
+	}
+}
+
+func TestVerifyIsOffUnlessAsked(t *testing.T) {
+	_, gm := buildModule(t, buildableMain)
+	var steps []string
+
+	if err := NewUpdater(gm).UpdateAllWithProgress("1.21", nil, false, verifySteps(&steps)); err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 0 {
+		t.Errorf("no build check was requested, but saw %v", steps)
+	}
+}
+
+// The check runs after the update, so the only way to see it fail is for the
+// update to break the build; the callback does that when the check starts.
+func TestVerifyRollsBackWhenTheBuildBreaks(t *testing.T) {
+	dir, gm := buildModule(t, buildableMain)
+	original, _ := os.ReadFile(gm.FilePath)
+
+	var steps []string
+	record := verifySteps(&steps)
+	breakIt := func(cur, total int, module, status string) {
+		record(cur, total, module, status)
+		if module == VerifyLabel && status == "verifying" {
+			os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() { undefined() }\n"), 0o644)
+		}
+	}
+
+	err := NewUpdater(gm).WithVerify().UpdateAllWithProgress("1.22", nil, false, breakIt)
+
+	if !errors.Is(err, ErrVerifyFailed) {
+		t.Fatalf("err = %v, want ErrVerifyFailed", err)
+	}
+	if got, _ := os.ReadFile(gm.FilePath); string(got) != string(original) {
+		t.Errorf("go.mod was not restored (the 1.22 directive is still there):\n%s", got)
+	}
+	if last := steps[len(steps)-1]; last != "error" {
+		t.Errorf("last build check status = %s, want error (steps %v)", last, steps)
+	}
+}
+
+// A project that does not build already would fail every check whatever was
+// updated; the check must stand down instead of rolling every update back.
+func TestVerifyStandsDownWhenTheBaselineBuildFails(t *testing.T) {
+	_, gm := buildModule(t, "package main\n\nfunc main() { undefined() }\n")
+	var steps []string
+
+	err := NewUpdater(gm).WithVerify().UpdateAllWithProgress("1.22", nil, false, verifySteps(&steps))
+
+	if err != nil {
+		t.Fatalf("a broken baseline must not fail the update: %v", err)
+	}
+	if got := strings.Join(steps, ","); got != "checking,skipped" {
+		t.Errorf("build check steps = %s, want checking,skipped", got)
+	}
+	if got, _ := os.ReadFile(gm.FilePath); !strings.Contains(string(got), "go 1.22") {
+		t.Errorf("the update itself should still have been applied:\n%s", got)
+	}
+}

@@ -18,6 +18,7 @@ import (
 type release struct {
 	version string
 	goDir   string // the go directive in that release's go.mod
+	source  string // the release's Go source; a bare package clause when empty
 }
 
 // fakeProxy serves just enough of the GOPROXY protocol for go list and go get.
@@ -70,6 +71,14 @@ func (p *fakeProxy) sleep(r *http.Request, kind string) {
 	case <-time.After(p.delayFor(kind)):
 	case <-r.Context().Done():
 	}
+}
+
+// resetHits forgets the requests seen so far, so waitForHit sees only what the
+// program under test sends (the fixture's own go mod tidy used the proxy too).
+func (p *fakeProxy) resetHits() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.hits = map[string]int{}
 }
 
 // waitForHit blocks until a request of the given kind has arrived, which tells a
@@ -164,9 +173,13 @@ func moduleZip(module string, rel release) []byte {
 	zw := zip.NewWriter(&buf)
 	prefix := module + "@" + rel.version + "/"
 	pkg := module[strings.LastIndex(module, "/")+1:]
+	src := rel.source
+	if src == "" {
+		src = "package " + pkg + "\n"
+	}
 	for name, body := range map[string]string{
 		"go.mod":    goMod(module, rel.goDir),
-		pkg + ".go": "package " + pkg + "\n",
+		pkg + ".go": src,
 	} {
 		f, _ := zw.Create(prefix + name)
 		f.Write([]byte(body))
