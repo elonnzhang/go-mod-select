@@ -1,8 +1,13 @@
 package controller
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"go-mod-select/pkg/finder"
 	"go-mod-select/pkg/parser"
@@ -43,6 +48,20 @@ func Run(cfg *Config) error {
 	// also hand the selection back for the caller to apply, which ran every
 	// `go get` a second time.
 	return ui.TUI(cfg.TargetGoVersion, goMod, projectRoot)
+}
+
+// updateFailure words a failed unattended update. It must not claim the files
+// were restored when the rollback itself failed: the output may be all a CI log
+// or an unattended user ever sees.
+func updateFailure(err error) error {
+	switch {
+	case errors.Is(err, updater.ErrRollbackFailed):
+		return fmt.Errorf("update failed and the rollback was incomplete; inspect go.mod and go.sum (e.g. git diff): %w", err)
+	case errors.Is(err, updater.ErrCancelled):
+		return errors.New("interrupted (go.mod and go.sum restored)")
+	default:
+		return fmt.Errorf("update failed (go.mod and go.sum restored): %w", err)
+	}
 }
 
 // printPlan reports the analysis outcome shared by dry-run and auto modes.
@@ -119,9 +138,15 @@ func runAutoMode(cfg *Config, goMod *parser.GoMod, projectRoot string) error {
 		return nil
 	}
 
-	upd := updater.NewUpdater(goMod)
+	// Without this, Ctrl+C reaches `go get` and this process alike, both die, and
+	// the rewritten go.mod is never rolled back. Catching the signal lets the
+	// updater interrupt the command in flight and restore both files.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+
+	upd := updater.NewUpdater(goMod).WithContext(ctx)
 	if err := upd.UpdateAll(cfg.TargetGoVersion, apply, cfg.Verbose); err != nil {
-		return fmt.Errorf("update failed (go.mod and go.sum restored): %w", err)
+		return updateFailure(err)
 	}
 
 	// `go mod tidy` can raise the go directive past what was requested when a

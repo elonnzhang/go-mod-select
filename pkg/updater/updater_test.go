@@ -1,6 +1,8 @@
 package updater
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -277,5 +279,94 @@ func TestRollbackPreservesFileMode(t *testing.T) {
 	// A hard-coded 0o644 would widen a deliberately stricter mode.
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("mode = %o, want 600", perm)
+	}
+}
+
+// TestCancelledRunRollsBack covers Ctrl+C during an update: the run must stop
+// with ErrCancelled and leave go.mod exactly as it found it, rather than
+// abandoning a half-applied go directive.
+func TestCancelledRunRollsBack(t *testing.T) {
+	t.Setenv("GOPROXY", "off")
+	t.Setenv("GOFLAGS", "")
+
+	_, gm := writeModule(t, sampleGoSum, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	mods := []*finder.ModuleInfo{{
+		Path:             "github.com/fatih/color",
+		CurrentVersion:   "v1.14.1",
+		LatestCompatible: "v1.18.0",
+	}}
+
+	err := NewUpdater(gm).WithContext(ctx).UpdateAllWithProgress("1.25", mods, false, nil)
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("err = %v, want ErrCancelled", err)
+	}
+
+	got, _ := os.ReadFile(gm.FilePath)
+	if string(got) != sampleGoMod {
+		t.Errorf("go.mod was not restored after cancellation:\n%s", got)
+	}
+}
+
+func TestRunGoReportsInterruptionAsCancelled(t *testing.T) {
+	_, gm := writeModule(t, sampleGoSum, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	u := NewUpdater(gm).WithContext(ctx)
+	cancel()
+
+	if err := u.runGo(false, "version"); !errors.Is(err, ErrCancelled) {
+		t.Errorf("runGo on a cancelled context = %v, want ErrCancelled", err)
+	}
+}
+
+// TestRollbackNeverDeletesAnUnreadableGoSum covers a go.sum that exists but
+// could not be read for the snapshot (here: it is a directory, so ReadFile
+// fails with something other than "not exist"). That used to be recorded as
+// "go.sum did not exist", and Rollback then removed it.
+func TestRollbackNeverDeletesAnUnreadableGoSum(t *testing.T) {
+	dir, gm := writeModule(t, "", false)
+	sumPath := filepath.Join(dir, "go.sum")
+	if err := os.Mkdir(sumPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := NewUpdater(gm).Rollback()
+
+	if _, statErr := os.Stat(sumPath); statErr != nil {
+		t.Errorf("rollback removed a go.sum it could not read: %v", statErr)
+	}
+	if !errors.Is(err, ErrRollbackFailed) {
+		t.Errorf("an unrestorable go.sum must be reported, got %v", err)
+	}
+}
+
+// An interrupted step is the user's doing, not a failure of the module: the UI
+// used to log "✗ update failed" for a module whose go get the user had stopped.
+func TestInterruptedStepReportsNoErrorStatus(t *testing.T) {
+	t.Setenv("GOPROXY", "off")
+	t.Setenv("GOFLAGS", "")
+	_, gm := writeModule(t, sampleGoSum, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var statuses []string
+	cb := func(_, _ int, _ string, status string) {
+		statuses = append(statuses, status)
+		if status == "updating" {
+			cancel() // the user presses Ctrl+C while go get is starting
+		}
+	}
+
+	mods := []*finder.ModuleInfo{{Path: "github.com/fatih/color", CurrentVersion: "v1.14.1", LatestCompatible: "v1.18.0"}}
+	err := NewUpdater(gm).WithContext(ctx).UpdateModulesWithProgress(mods, false, cb)
+
+	if !errors.Is(err, ErrCancelled) {
+		t.Fatalf("err = %v, want ErrCancelled", err)
+	}
+	if len(statuses) != 1 || statuses[0] != "updating" {
+		t.Errorf("statuses = %v, want only [updating]", statuses)
 	}
 }

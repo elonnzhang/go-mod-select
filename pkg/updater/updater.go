@@ -2,12 +2,14 @@ package updater
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"go-mod-select/pkg/finder"
 	"go-mod-select/pkg/logger"
@@ -21,10 +23,27 @@ type ProgressCallback func(current, total int, module, status string)
 // `go mod tidy` step. Callers match on it to render that step differently.
 const TidyLabel = "go mod tidy"
 
+// ErrCancelled is returned (wrapped) when the context given to WithContext is
+// cancelled mid-run. By the time it is returned both module files have already
+// been restored.
+var ErrCancelled = errors.New("update cancelled")
+
+// ErrRollbackFailed marks an error from a run whose rollback did not complete,
+// so go.mod or go.sum may still hold a half-applied update.
+var ErrRollbackFailed = errors.New("rollback failed")
+
+// interruptGrace is how long a go subprocess gets to exit after SIGINT before it
+// is killed outright.
+const interruptGrace = 5 * time.Second
+
 // Updater handles updating Go modules and the go.mod file
 type Updater struct {
 	goMod   *parser.GoMod
 	workDir string
+
+	// ctx, when set, aborts the run: the go subprocess in flight is interrupted
+	// and no further step starts.
+	ctx context.Context
 
 	// Snapshot of both module files taken before the first mutation. `go get`
 	// rewrites go.sum as well as go.mod, so restoring only go.mod would leave
@@ -34,6 +53,9 @@ type Updater struct {
 	// goSumExisted distinguishes "go.sum was empty" from "go.sum did not
 	// exist", so rollback can delete a file we caused to be created.
 	goSumExisted bool
+	// goSumUnreadable is set when go.sum exists but could not be read for the
+	// snapshot; rollback must then leave it untouched rather than delete it.
+	goSumUnreadable bool
 }
 
 // NewUpdater snapshots the module files as they are on disk right now.
@@ -60,9 +82,17 @@ func NewUpdater(goMod *parser.GoMod) *Updater {
 		u.goModBackup = goMod.Backup()
 	}
 
-	if sum, err := os.ReadFile(u.goSumPath()); err == nil {
+	sum, err := os.ReadFile(u.goSumPath())
+	switch {
+	case err == nil:
 		u.goSumBackup = sum
 		u.goSumExisted = true
+	case !os.IsNotExist(err):
+		// Present but unreadable (permissions, I/O error). Treating that as
+		// "absent" would make Rollback delete a go.sum we merely failed to read.
+		logger.Log.Warn("could not read go.sum for backup; rollback will leave it alone",
+			"path", u.goSumPath(), "error", err.Error())
+		u.goSumUnreadable = true
 	}
 
 	return u
@@ -70,6 +100,19 @@ func NewUpdater(goMod *parser.GoMod) *Updater {
 
 func (u *Updater) goSumPath() string {
 	return filepath.Join(u.workDir, "go.sum")
+}
+
+// WithContext makes the run cancellable. Cancelling interrupts the go command
+// in flight and stops the run with ErrCancelled, after which UpdateAll* has
+// rolled go.mod and go.sum back like any other failure.
+func (u *Updater) WithContext(ctx context.Context) *Updater {
+	u.ctx = ctx
+	return u
+}
+
+// cancelled reports whether the run's context has been cancelled.
+func (u *Updater) cancelled() bool {
+	return u.ctx != nil && u.ctx.Err() != nil
 }
 
 // UpdateGoVersion updates the Go version in go.mod
@@ -85,12 +128,18 @@ func (u *Updater) UpdateModulesWithProgress(modules []*finder.ModuleInfo, verbos
 	total := len(modules)
 
 	for i, mod := range modules {
+		if u.cancelled() {
+			return ErrCancelled
+		}
+
 		if progressCb != nil {
 			progressCb(i+1, total, mod.Path, "updating")
 		}
 
 		if err := u.updateSingleModule(mod, verbose); err != nil {
-			if progressCb != nil {
+			// An interrupted step is not a failure of the module; the caller
+			// reports the cancellation itself.
+			if progressCb != nil && !errors.Is(err, ErrCancelled) {
 				progressCb(i+1, total, mod.Path, "error")
 			}
 			return fmt.Errorf("failed to update %s: %w", mod.Path, err)
@@ -113,8 +162,17 @@ func (u *Updater) updateSingleModule(mod *finder.ModuleInfo, verbose bool) error
 // runGo runs a go subcommand in the target module directory, returning stderr
 // as part of the error so failures are actionable in the TUI log.
 func (u *Updater) runGo(verbose bool, args ...string) error {
-	cmd := exec.Command("go", args...)
+	ctx := u.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = u.workDir
+	// SIGINT lets go stop its own children (git, compilers) cleanly; the default
+	// SIGKILL would orphan them. WaitDelay still kills a go that ignores it.
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = interruptGrace
 
 	var stderr bytes.Buffer
 	if verbose {
@@ -125,6 +183,10 @@ func (u *Updater) runGo(verbose bool, args ...string) error {
 	}
 
 	if err := cmd.Run(); err != nil {
+		if u.cancelled() {
+			logger.Log.Info("go command interrupted", "args", args)
+			return fmt.Errorf("go %s interrupted: %w", args[0], ErrCancelled)
+		}
 		logger.Log.Error("go command failed", "args", args, "error", err.Error(), "stderr", stderr.String())
 		return fmt.Errorf("go %s: %w\n%s", args[0], err, bytes.TrimSpace(stderr.Bytes()))
 	}
@@ -140,6 +202,10 @@ func (u *Updater) UpdateModules(modules []*finder.ModuleInfo, verbose bool) erro
 	fmt.Printf("\n[INFO] Updating %d module(s)...\n", len(modules))
 
 	for i, mod := range modules {
+		if u.cancelled() {
+			return ErrCancelled
+		}
+
 		fmt.Printf("[%d/%d] Updating %s: %s → %s...\n",
 			i+1, len(modules), mod.Path, mod.CurrentVersion, mod.LatestCompatible)
 
@@ -160,7 +226,7 @@ func (u *Updater) TidyWithProgress(verbose bool, progressCb ProgressCallback) er
 	}
 
 	if err := u.runGo(verbose, "mod", "tidy"); err != nil {
-		if progressCb != nil {
+		if progressCb != nil && !errors.Is(err, ErrCancelled) {
 			progressCb(0, 0, TidyLabel, "error")
 		}
 		return fmt.Errorf("go mod tidy failed: %w", err)
@@ -216,6 +282,8 @@ func (u *Updater) Rollback() error {
 	}
 
 	switch {
+	case u.goSumUnreadable:
+		errs = append(errs, errors.New("go.sum could not be read before the update, so it was not restored"))
 	case u.goSumExisted:
 		mode := os.FileMode(0o644)
 		if info, err := os.Stat(u.goSumPath()); err == nil {
@@ -233,7 +301,7 @@ func (u *Updater) Rollback() error {
 
 	if len(errs) > 0 {
 		logger.Log.Error("rollback incomplete", "errors", fmt.Sprint(errs))
-		return fmt.Errorf("rollback failed: %w", errors.Join(errs...))
+		return fmt.Errorf("%w: %w", ErrRollbackFailed, errors.Join(errs...))
 	}
 
 	logger.Log.Info("rolled back go.mod and go.sum")
@@ -241,10 +309,11 @@ func (u *Updater) Rollback() error {
 }
 
 // rollbackOn wraps a failure with rollback, surfacing a rollback error as
-// additional context rather than swallowing either one.
+// additional context rather than swallowing either one. Both stay matchable
+// with errors.Is.
 func (u *Updater) rollbackOn(cause error) error {
 	if rbErr := u.Rollback(); rbErr != nil {
-		return fmt.Errorf("%w (%v)", cause, rbErr)
+		return fmt.Errorf("%w (%w)", cause, rbErr)
 	}
 	return cause
 }
