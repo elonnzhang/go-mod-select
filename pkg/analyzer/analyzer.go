@@ -89,10 +89,13 @@ func usesPackage(filePath, packagePath string) bool {
 
 // FindWhyPackageNeeded uses go mod why to find why a package is needed.
 //
-// -mod=readonly keeps the inspection side-effect free: the user is only
-// browsing a detail popup and should not have their go.mod rewritten by it.
+// `go mod why` does not take -mod (it rejects the flag outright) and is already
+// read-only: it reports a go.mod that needs changes instead of rewriting it.
+// The environment is left as is, so a -modfile in the user's GOFLAGS applies
+// here exactly as it does to the updater's go get; a -mod there is ignored,
+// because the command does not define the flag.
 func FindWhyPackageNeeded(projectRoot, packagePath string) []string {
-	cmd := exec.Command("go", "mod", "why", "-m", "-mod=readonly", packagePath)
+	cmd := exec.Command("go", "mod", "why", "-m", packagePath)
 	cmd.Dir = projectRoot
 
 	var stdout, stderr bytes.Buffer
