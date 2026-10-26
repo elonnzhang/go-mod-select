@@ -15,11 +15,14 @@ go-mod-select/
 │   ├── ui/
 │   │   ├── app_model.go     # Bubbletea 模型、消息、按键分发
 │   │   ├── app_render.go    # 各屏幕渲染
-│   │   ├── app_helpers.go   # 分析 worker、详情加载、派生状态
+│   │   ├── app_helpers.go   # worker 编排、详情加载、派生状态、退出时的收尾
+│   │   ├── app_styles.go    # 按主题一次性构建的样式
 │   │   ├── app_keys.go      # 按键绑定表
 │   │   └── banner.txt       # 嵌入的 ASCII banner
-│   ├── updater/             # go get / go mod tidy / 回滚 / 版本校验
+│   ├── scan/                # 并发查询每个直接依赖的最新兼容版本（TUI 与 CLI 共用）
+│   ├── updater/             # go get / go mod tidy / 回滚 / 取消 / 版本校验
 │   ├── controller/          # 模式分派（dry-run / auto / TUI）
+├── e2e/                     # 伪终端 + 假 GOPROXY 的端到端测试
 │   ├── analyzer/            # AST 导入扫描、go mod why
 │   ├── logger/              # slog JSON 日志
 │   └── config/              # 颜色配置
@@ -129,6 +132,17 @@ NewUpdater(goMod *parser.GoMod) *Updater   // 构造时快照 go.mod + go.sum
 1. 解析 go.mod
 2. 按模式分派：dry-run 只分析并打印；auto 分析后直接应用；交互模式交给 TUI
 3. TUI 自己完成更新（不再把选择结果回传给 controller 重复执行一遍）
+
+dry-run 与 auto 通过 `pkg/scan` 做分析，不再经由 `pkg/ui`。整个命令行运行共用一个 `signal.NotifyContext`（SIGINT / SIGTERM / SIGHUP）：分析被中断时 `finder` 的 `go list` 子进程被终止、沙箱目录被清理；更新被中断时 updater 中断 `go get` 并回滚。查询失败的模块不会被悄悄漏掉，而是在计划之后单独列出。
+
+### 6.1 Scan Module (`pkg/scan/`)
+
+**职责**：对每个直接依赖并发查询"目标 Go 版本能构建的最新版本"。它只依赖一个 `LookupFunc`，所以不关心结果怎么展示，也不依赖 `finder` 的内部实现，便于单测。
+
+- 并发上限 `Concurrency = 12`
+- 每个查询自带 recover，panic 变成该模块的错误结果，而不是带着 raw mode 杀死进程
+- `progress` 回调返回 false 表示调用方正在退出，该查询被放弃（TUI 用它避免阻塞在没人读的 channel 上）
+- 结果按模块路径排序，Update 页不会在两次运行之间换位
 
 ### 7. Analyzer Module (`pkg/analyzer/`)
 
@@ -333,10 +347,12 @@ main
       └── controller
            ├── parser
            ├── finder
+           ├── scan ── finder
            ├── ui
            │    ├── analyzer
            │    ├── config
            │    ├── finder
+           │    ├── scan
            │    └── updater
            └── updater
 ```
