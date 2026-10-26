@@ -53,6 +53,9 @@ go-mod-select 1.25 --dry-run
 # 自动选择并应用所有兼容更新
 go-mod-select 1.25 --auto
 
+# 更新后检查项目还能构建，不能就整体回滚
+go-mod-select 1.25 --auto --verify
+
 # 查看详细日志
 go-mod-select 1.25 --verbose
 ```
@@ -82,6 +85,7 @@ go-mod-select 1.25 --verbose
 | `g` / `G`              | 跳到首 / 尾                                        |
 | `Space`                | 选择/取消（Update 标签页）或查看详情（其他标签页） |
 | `a`                    | 全选/取消当前可见项（Update 标签页）               |
+| `v`                    | 开关更新后的构建校验（Update 标签页）              |
 | `Tab` / `Shift+Tab`    | 切换标签页                                         |
 | `/`                    | 过滤模式（四个标签页都可用）                       |
 | `Enter`                | 确认更新（Update 标签页）                          |

@@ -119,6 +119,8 @@ NewUpdater(goMod *parser.GoMod) *Updater   // 构造时快照 go.mod + go.sum
 (*Updater).Rollback() error
 ```
 
+`WithVerify()` 打开构建校验：更新前先跑一次 `go build ./...` 作基线，基线能过才在 tidy 之后再跑一次，失败就返回 `ErrVerifyFailed` 并整体回滚；基线本身失败则跳过校验（否则每次更新都会因与之无关的原因被回滚）。两次构建通过进度回调以 `VerifyLabel` 上报，和 `TidyLabel` 一样不算"逐模块"步骤，所以不会清零模块计数器。
+
 `VerifyGoVersion` 存在的原因：`go mod tidy` 会在剩余依赖需要更新工具链时主动抬高 go 指令，所以"请求的版本"不等于"磁盘上的版本"。不校验就会把"降级到 1.17"悄悄变成"仍然是 1.25"。
 
 ### 6. Controller Module (`pkg/controller/`)
