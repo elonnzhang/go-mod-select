@@ -163,3 +163,16 @@ func CountIndirectDeps(requires []Require) int {
 	}
 	return count
 }
+
+// SplitRequires separates require directives into direct and indirect ones,
+// each in go.mod order.
+func SplitRequires(requires []Require) (direct, indirect []Require) {
+	for _, req := range requires {
+		if req.Indirect {
+			indirect = append(indirect, req)
+		} else {
+			direct = append(direct, req)
+		}
+	}
+	return direct, indirect
+}

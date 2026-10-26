@@ -10,6 +10,7 @@ import (
 	"go-mod-select/pkg/finder"
 	"go-mod-select/pkg/logger"
 	"go-mod-select/pkg/parser"
+	"go-mod-select/pkg/scan"
 	"go-mod-select/pkg/updater"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -134,19 +135,12 @@ type ReplaceInfo struct {
 	New string
 }
 
-type AnalyzedPackage struct {
-	Pkg    string
-	Info   *finder.ModuleInfo
-	Err    error
-	Status string // "found", "skipped", "error"
-}
-
 // Messages
 type analyzeCompleteMsg struct {
 	requireModules    []*finder.ModuleInfo
 	indirectModules   []parser.Require
 	replaces          []ReplaceInfo
-	completedPackages []AnalyzedPackage
+	completedPackages []scan.Result
 }
 
 type analyzeProgressMsg struct {
@@ -416,7 +410,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.refreshed != nil {
 			m.goMod = msg.refreshed
-			m.requireModules, m.indirectModules = splitRequires(m.goMod.Requires)
+			m.requireModules, m.indirectModules = parser.SplitRequires(m.goMod.Requires)
 			m.replaceModules = replaceInfos(m.goMod)
 		}
 		m.currentScreen = screenComplete

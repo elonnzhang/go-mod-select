@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,6 +15,7 @@ import (
 	"go-mod-select/pkg/finder"
 	"go-mod-select/pkg/logger"
 	"go-mod-select/pkg/parser"
+	"go-mod-select/pkg/scan"
 	"go-mod-select/pkg/updater"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -25,10 +24,10 @@ import (
 
 // Analysis status values shared between the worker and the renderer.
 const (
-	statusChecking = "checking"
-	statusFound    = "found"
-	statusSkipped  = "skipped"
-	statusError    = "error"
+	statusChecking = scan.StatusChecking
+	statusFound    = scan.StatusFound
+	statusSkipped  = scan.StatusSkipped
+	statusError    = scan.StatusError
 )
 
 // logPrefix returns the tag used to store a status in analysisLogs. Storing
@@ -387,18 +386,6 @@ func (m AppModel) countSelected() int {
 	return count
 }
 
-// splitRequires separates go.mod's require directives into direct and indirect.
-func splitRequires(requires []parser.Require) (direct, indirect []parser.Require) {
-	for _, req := range requires {
-		if req.Indirect {
-			indirect = append(indirect, req)
-		} else {
-			direct = append(direct, req)
-		}
-	}
-	return direct, indirect
-}
-
 // replaceInfos renders go.mod's replace directives for display.
 func replaceInfos(goMod *parser.GoMod) []ReplaceInfo {
 	var replaces []ReplaceInfo
@@ -419,7 +406,7 @@ func replaceInfos(goMod *parser.GoMod) []ReplaceInfo {
 // analyzeModules starts the analysis process and returns a subscription command
 func (m AppModel) analyzeModules() tea.Cmd {
 	return func() tea.Msg {
-		directRequires, indirectRequires := splitRequires(m.goMod.Requires)
+		directRequires, indirectRequires := parser.SplitRequires(m.goMod.Requires)
 
 		total := len(directRequires)
 		if total == 0 {
@@ -427,7 +414,7 @@ func (m AppModel) analyzeModules() tea.Cmd {
 				requireModules:    []*finder.ModuleInfo{},
 				indirectModules:   indirectRequires,
 				replaces:          []ReplaceInfo{},
-				completedPackages: []AnalyzedPackage{},
+				completedPackages: []scan.Result{},
 			}
 		}
 
@@ -461,15 +448,6 @@ func waitForAnalysisMsg(sub <-chan tea.Msg) tea.Cmd {
 	}
 }
 
-// analyzeConcurrency bounds how many `go list` subprocesses run at once.
-//
-// Each worker spawns a subprocess that does network I/O against the module
-// proxy. The previous limit of 200 spawned hundreds of processes for a large
-// go.mod, which the proxy rate-limits and the OS charges for in context
-// switches; a modest pool is both faster in practice and far kinder to the
-// machine.
-const analyzeConcurrency = 12
-
 // send delivers a message unless the program is shutting down.
 //
 // The channel is unbuffered and its only reader is a bubbletea Cmd. Once the
@@ -500,18 +478,6 @@ func startAnalysisWorker(msg startAnalysisMsg, sub chan<- tea.Msg, done <-chan s
 		}
 	}()
 
-	total := len(msg.directRequires)
-
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, analyzeConcurrency)
-
-	// Results are collected under a mutex rather than through a channel so the
-	// worker never blocks on a reader that has gone away.
-	var mu sync.Mutex
-	completedPackages := make([]AnalyzedPackage, 0, total)
-
-	var completed int32
-
 	// Cancelling the finder's context kills the in-flight `go list` children
 	// instead of orphaning a dozen proxy requests.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -527,105 +493,26 @@ func startAnalysisWorker(msg startAnalysisMsg, sub chan<- tea.Msg, done <-chan s
 	f := finder.NewWithContext(ctx, msg.projectRoot)
 	defer f.Close()
 
-	for _, req := range msg.directRequires {
-		wg.Add(1)
-		go func(r parser.Require) {
-			defer wg.Done()
-
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-done:
-				return
-			}
-
-			if !send(sub, done, analyzeProgressMsg{
-				packageName: r.Path,
-				current:     int(atomic.LoadInt32(&completed)),
-				total:       total,
-				status:      statusChecking,
-			}) {
-				return
-			}
-
-			info, err := findSafely(f, r.Path, r.Version, msg.targetGoVersion)
-			pkg := AnalyzedPackage{
-				Pkg:    r.Path,
-				Info:   info,
-				Err:    err,
-				Status: classify(info, err, r.Version),
-			}
-
-			current := int(atomic.AddInt32(&completed, 1))
-
-			if !send(sub, done, analyzeProgressMsg{
-				packageName: r.Path,
-				current:     current,
-				total:       total,
-				status:      pkg.Status,
-			}) {
-				return
-			}
-
-			mu.Lock()
-			completedPackages = append(completedPackages, pkg)
-			mu.Unlock()
-		}(req)
+	lookup := func(path, current string) (*finder.ModuleInfo, error) {
+		return f.FindCompatibleVersions(path, current, msg.targetGoVersion)
 	}
-
-	wg.Wait()
-
-	// Stable order so the Update tab does not shuffle between runs.
-	sort.Slice(completedPackages, func(i, j int) bool {
-		return completedPackages[i].Pkg < completedPackages[j].Pkg
+	// send blocks until the UI reads or the program quits; scan treats a false
+	// return as "abandon this lookup".
+	results := scan.Run(ctx, lookup, msg.directRequires, func(ev scan.Event) bool {
+		return send(sub, done, analyzeProgressMsg{
+			packageName: ev.Pkg,
+			current:     ev.Completed,
+			total:       ev.Total,
+			status:      ev.Status,
+		})
 	})
-
-	requireModules := extractUpdatable(completedPackages)
 
 	send(sub, done, analyzeCompleteMsg{
-		requireModules:    requireModules,
+		requireModules:    scan.Updatable(results),
 		indirectModules:   msg.indirectRequires,
 		replaces:          replaceInfos(msg.goMod),
-		completedPackages: completedPackages,
+		completedPackages: results,
 	})
-}
-
-// findSafely is FindCompatibleVersions with a panic turned into an error.
-// Each lookup runs in its own goroutine, outside the recover that guards the
-// worker's coordinator, so an unrecovered panic here would take the whole
-// process down with the terminal still in raw mode.
-func findSafely(f *finder.Finder, path, current, target string) (info *finder.ModuleInfo, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Log.Error("version lookup panicked", "module", path, "panic", fmt.Sprint(r))
-			info, err = nil, fmt.Errorf("internal error: %v", r)
-		}
-	}()
-	return f.FindCompatibleVersions(path, current, target)
-}
-
-// classify maps an analysis result to the status string the TUI renders.
-func classify(info *finder.ModuleInfo, err error, currentVersion string) string {
-	switch {
-	case err != nil:
-		return statusError
-	case info != nil && info.LatestCompatible != currentVersion:
-		return statusFound
-	default:
-		return statusSkipped
-	}
-}
-
-// extractUpdatable keeps only the modules whose newest compatible version
-// differs from the version currently pinned in go.mod.
-func extractUpdatable(pkgs []AnalyzedPackage) []*finder.ModuleInfo {
-	var out []*finder.ModuleInfo
-	for _, pkg := range pkgs {
-		if pkg.Err == nil && pkg.Info != nil && pkg.Info.LatestCompatible != pkg.Info.CurrentVersion {
-			out = append(out, pkg.Info)
-		}
-	}
-	return out
 }
 
 func (m AppModel) handleAnalyzeComplete(msg analyzeCompleteMsg) (tea.Model, tea.Cmd) {
@@ -643,7 +530,7 @@ func (m AppModel) handleAnalyzeComplete(msg analyzeCompleteMsg) (tea.Model, tea.
 	}
 
 	// Direct and indirect requires come from go.mod for the read-only tabs.
-	m.requireModules, m.indirectModules = splitRequires(m.goMod.Requires)
+	m.requireModules, m.indirectModules = parser.SplitRequires(m.goMod.Requires)
 	m.replaceModules = msg.replaces
 
 	// The terminal size is already known, so lay the list out right here.
@@ -766,58 +653,6 @@ func startUpdateWorker(ctx context.Context, cancel context.CancelFunc, msg start
 		goVersionMatched: matched || err != nil,
 		refreshed:        refreshed,
 	})
-}
-
-// analyzePackagesParallel analyzes packages in parallel and returns detailed
-// results, sorted by module path. Shared by the TUI-free CLI modes.
-func analyzePackagesParallel(requires []parser.Require, targetGoVersion, projectRoot string) []AnalyzedPackage {
-	f := finder.New(projectRoot)
-	defer f.Close()
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	semaphore := make(chan struct{}, analyzeConcurrency)
-	analyzed := make([]AnalyzedPackage, 0, len(requires))
-
-	for _, req := range requires {
-		wg.Add(1)
-		go func(r parser.Require) {
-			defer wg.Done()
-
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			info, err := findSafely(f, r.Path, r.Version, targetGoVersion)
-			pkg := AnalyzedPackage{
-				Pkg:    r.Path,
-				Info:   info,
-				Err:    err,
-				Status: classify(info, err, r.Version),
-			}
-
-			mu.Lock()
-			analyzed = append(analyzed, pkg)
-			mu.Unlock()
-		}(req)
-	}
-
-	wg.Wait()
-
-	sort.Slice(analyzed, func(i, j int) bool { return analyzed[i].Pkg < analyzed[j].Pkg })
-	return analyzed
-}
-
-// FindCompatibleVersionsParallel finds compatible versions for all direct
-// dependencies. Convenience wrapper for the non-TUI CLI modes.
-func FindCompatibleVersionsParallel(requires []parser.Require, targetGoVersion, projectRoot string) []*finder.ModuleInfo {
-	var directRequires []parser.Require
-	for _, req := range requires {
-		if !req.Indirect {
-			directRequires = append(directRequires, req)
-		}
-	}
-
-	return extractUpdatable(analyzePackagesParallel(directRequires, targetGoVersion, projectRoot))
 }
 
 // logBoxHeight is the fixed height of the bottom log pane on the analyzing and

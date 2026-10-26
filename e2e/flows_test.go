@@ -3,6 +3,8 @@
 package e2e
 
 import (
+	"bytes"
+	"os/exec"
 	"regexp"
 	"strings"
 	"syscall"
@@ -196,4 +198,102 @@ func TestHangupDuringUpdateRollsBack(t *testing.T) {
 	tm.signal(syscall.SIGHUP)
 	tm.wait(quick)
 	assertRolledBack(t, sb, original)
+}
+
+// cli is a non-interactive run that a test can signal while it works.
+type cli struct {
+	cmd *exec.Cmd
+	out *bytes.Buffer
+}
+
+func (sb *sandbox) startCLI(args ...string) *cli {
+	sb.t.Helper()
+	c := &cli{cmd: exec.Command(bin, append([]string{sb.target, "--dir", sb.dir}, args...)...), out: &bytes.Buffer{}}
+	c.cmd.Env = sb.env
+	c.cmd.Dir = sb.dir
+	c.cmd.Stdout, c.cmd.Stderr = c.out, c.out
+	if err := c.cmd.Start(); err != nil {
+		sb.t.Fatal(err)
+	}
+	sb.t.Cleanup(func() { c.cmd.Process.Kill(); c.cmd.Wait() })
+	return c
+}
+
+// finish waits for the run to end and returns its output and whether it
+// exited non-zero.
+func (c *cli) finish(t *testing.T) (string, bool) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- c.cmd.Wait() }()
+	select {
+	case err := <-done:
+		return c.out.String(), err != nil
+	case <-time.After(waitTimeout):
+		t.Fatalf("still running after %v; output:\n%s", waitTimeout, c.out.String())
+		return "", false
+	}
+}
+
+// Without catching the signal, Ctrl+C killed go get and this process together,
+// and nothing rolled go.mod back.
+func TestAutoModeInterruptedMidUpdateRollsBack(t *testing.T) {
+	p := newFakeProxy(t)
+	twoReleases(p, "example.com/dep1", "example.com/dep2")
+	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2")
+	sb.target = "1.22"
+	original := sb.read("go.mod")
+	p.delay("zip", 20*time.Second)
+
+	run := sb.startCLI("--auto")
+	p.waitForHit(t, "zip") // go get is now blocked downloading
+	run.cmd.Process.Signal(syscall.SIGINT)
+
+	out, failed := run.finish(t)
+	if !failed || !strings.Contains(out, "interrupted") {
+		t.Errorf("an interrupted run should fail with \"interrupted\" (failed=%v):\n%s", failed, out)
+	}
+	assertRolledBack(t, sb, original)
+}
+
+// An interrupted analysis must clean up after itself like a finished one.
+func TestDryRunInterruptedMidAnalysisLeavesNothingBehind(t *testing.T) {
+	p := newFakeProxy(t)
+	twoReleases(p, "example.com/dep1", "example.com/dep2")
+	p.delay("*", 20*time.Second)
+	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2")
+
+	run := sb.startCLI("--dry-run")
+	p.waitForHit(t, "list")
+	if len(sb.scratchDirs()) == 0 {
+		t.Fatal("precondition: the analysis should have a scratch module by now")
+	}
+	run.cmd.Process.Signal(syscall.SIGINT)
+
+	out, failed := run.finish(t)
+	if !failed || !strings.Contains(out, "interrupted") {
+		t.Errorf("want a failed run saying \"interrupted\" (failed=%v):\n%s", failed, out)
+	}
+	if left := sb.scratchDirs(); len(left) != 0 {
+		t.Errorf("scratch directories left behind: %v", left)
+	}
+}
+
+// A lookup that fails is not "already up to date". The plan used to leave such
+// modules out without a word.
+func TestDryRunNamesModulesItCouldNotAnalyze(t *testing.T) {
+	p := newFakeProxy(t)
+	twoReleases(p, "example.com/dep1")
+	sb := newSandbox(t, p, "example.com/dep1")
+	sb.write("go.mod", strings.Replace(sb.read("go.mod"), ")\n", "\texample.com/ghost v1.0.0\n)\n", 1))
+
+	out, err := sb.run("--dry-run")
+	if err != nil {
+		t.Fatalf("dry run failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "example.com/dep1: v1.0.0 → v1.1.0") {
+		t.Errorf("the module that could be analyzed is missing:\n%s", out)
+	}
+	if !strings.Contains(out, "1 module(s) could not be analyzed") || !strings.Contains(out, "example.com/ghost") {
+		t.Errorf("the failed lookup should be named:\n%s", out)
+	}
 }

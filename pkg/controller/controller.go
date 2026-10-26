@@ -11,6 +11,7 @@ import (
 
 	"go-mod-select/pkg/finder"
 	"go-mod-select/pkg/parser"
+	"go-mod-select/pkg/scan"
 	"go-mod-select/pkg/ui"
 	"go-mod-select/pkg/updater"
 )
@@ -37,17 +38,64 @@ func Run(cfg *Config) error {
 	// go commands must run inside the module being analysed, not the tool's cwd.
 	projectRoot := filepath.Dir(cfg.GoModPath)
 
-	switch {
-	case cfg.DryRun:
-		return runDryMode(cfg, goMod, projectRoot)
-	case cfg.AutoSelect:
-		return runAutoMode(cfg, goMod, projectRoot)
+	if cfg.DryRun || cfg.AutoSelect {
+		// Ctrl+C reaches `go` and this process alike. Left alone both die: the
+		// analysis strands its scratch module, and an update leaves go.mod
+		// half-rewritten. Catching the signal lets analysis clean up and the
+		// updater interrupt the command in flight and roll back.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+
+		if cfg.DryRun {
+			return runDryMode(ctx, cfg, goMod, projectRoot)
+		}
+		return runAutoMode(ctx, cfg, goMod, projectRoot)
 	}
 
 	// The TUI performs the update itself on its updating screen. It used to
 	// also hand the selection back for the caller to apply, which ran every
 	// `go get` a second time.
 	return ui.TUI(cfg.TargetGoVersion, goMod, projectRoot)
+}
+
+// errInterrupted ends a command-line run the user cancelled.
+var errInterrupted = errors.New("interrupted")
+
+// analyze looks up the newest compatible version of every direct requirement.
+// It returns the modules with a different version available, plus the lookups
+// that failed: an error is not "already up to date", and a plan that silently
+// omitted those modules would say it was.
+func analyze(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRoot string) ([]*finder.ModuleInfo, []scan.Result, error) {
+	f := finder.NewWithContext(ctx, projectRoot)
+	defer f.Close()
+
+	direct, _ := parser.SplitRequires(goMod.Requires)
+	results := scan.Run(ctx, func(path, current string) (*finder.ModuleInfo, error) {
+		return f.FindCompatibleVersions(path, current, cfg.TargetGoVersion)
+	}, direct, nil)
+
+	if ctx.Err() != nil {
+		return nil, nil, errInterrupted
+	}
+
+	var failed []scan.Result
+	for _, r := range results {
+		if r.Err != nil {
+			failed = append(failed, r)
+		}
+	}
+	return scan.Updatable(results), failed, nil
+}
+
+// printFailures lists lookups that could not be completed.
+func printFailures(failed []scan.Result) {
+	if len(failed) == 0 {
+		return
+	}
+	fmt.Printf("\n[WARN] %d module(s) could not be analyzed and are NOT covered by the plan above:\n", len(failed))
+	for _, r := range failed {
+		fmt.Printf("  - %s: %v\n", r.Pkg, r.Err)
+	}
 }
 
 // updateFailure words a failed unattended update. It must not claim the files
@@ -65,7 +113,7 @@ func updateFailure(err error) error {
 }
 
 // printPlan reports the analysis outcome shared by dry-run and auto modes.
-func printPlan(cfg *Config, goMod *parser.GoMod, infos []*finder.ModuleInfo) {
+func printPlan(cfg *Config, goMod *parser.GoMod, infos []*finder.ModuleInfo, unanalyzed int) {
 	fmt.Printf("[INFO] Module:            %s\n", goMod.Module)
 	fmt.Printf("[INFO] Current Go:        %s\n", goMod.GoVersion)
 	fmt.Printf("[INFO] Target Go:         %s\n", cfg.TargetGoVersion)
@@ -73,6 +121,10 @@ func printPlan(cfg *Config, goMod *parser.GoMod, infos []*finder.ModuleInfo) {
 	fmt.Printf("[INFO] Indirect deps:     %d\n", parser.CountIndirectDeps(goMod.Requires))
 
 	if len(infos) == 0 {
+		if unanalyzed > 0 {
+			fmt.Printf("\n[INFO] No updates found among the dependencies that could be analyzed.\n")
+			return
+		}
 		fmt.Printf("\n[INFO] All direct dependencies are already at their newest Go %s-compatible version.\n",
 			cfg.TargetGoVersion)
 		return
@@ -96,22 +148,30 @@ func printPlan(cfg *Config, goMod *parser.GoMod, infos []*finder.ModuleInfo) {
 }
 
 // runDryMode shows information without making changes
-func runDryMode(cfg *Config, goMod *parser.GoMod, projectRoot string) error {
+func runDryMode(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRoot string) error {
 	fmt.Printf("[INFO] Analyzing dependencies for compatibility with Go %s...\n\n", cfg.TargetGoVersion)
 
-	infos := ui.FindCompatibleVersionsParallel(goMod.Requires, cfg.TargetGoVersion, projectRoot)
-	printPlan(cfg, goMod, infos)
+	infos, failed, err := analyze(ctx, cfg, goMod, projectRoot)
+	if err != nil {
+		return err
+	}
+	printPlan(cfg, goMod, infos, len(failed))
+	printFailures(failed)
 
 	fmt.Println("\n[INFO] Dry run - no changes were made.")
 	return nil
 }
 
 // runAutoMode selects every compatible update and applies it without prompting.
-func runAutoMode(cfg *Config, goMod *parser.GoMod, projectRoot string) error {
+func runAutoMode(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRoot string) error {
 	fmt.Printf("[INFO] Auto mode - analyzing dependencies for Go %s...\n\n", cfg.TargetGoVersion)
 
-	infos := ui.FindCompatibleVersionsParallel(goMod.Requires, cfg.TargetGoVersion, projectRoot)
-	printPlan(cfg, goMod, infos)
+	infos, failed, err := analyze(ctx, cfg, goMod, projectRoot)
+	if err != nil {
+		return err
+	}
+	printPlan(cfg, goMod, infos, len(failed))
+	printFailures(failed)
 
 	// Downgrades are excluded from unattended runs. They are a legitimate
 	// outcome when the pinned version needs a newer toolchain than the target,
@@ -137,12 +197,6 @@ func runAutoMode(cfg *Config, goMod *parser.GoMod, projectRoot string) error {
 	if len(apply) == 0 && cfg.TargetGoVersion == goMod.GoVersion {
 		return nil
 	}
-
-	// Without this, Ctrl+C reaches `go get` and this process alike, both die, and
-	// the rewritten go.mod is never rolled back. Catching the signal lets the
-	// updater interrupt the command in flight and restore both files.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer stop()
 
 	upd := updater.NewUpdater(goMod).WithContext(ctx)
 	if err := upd.UpdateAll(cfg.TargetGoVersion, apply, cfg.Verbose); err != nil {

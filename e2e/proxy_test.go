@@ -25,12 +25,13 @@ type fakeProxy struct {
 	mu      sync.Mutex
 	modules map[string][]release // ascending, as go reports them
 	delays  map[string]time.Duration
+	hits    map[string]int
 	server  *httptest.Server
 }
 
 func newFakeProxy(t *testing.T) *fakeProxy {
 	t.Helper()
-	p := &fakeProxy{modules: map[string][]release{}, delays: map[string]time.Duration{}}
+	p := &fakeProxy{modules: map[string][]release{}, delays: map[string]time.Duration{}, hits: map[string]int{}}
 	p.server = httptest.NewServer(p)
 	t.Cleanup(p.server.Close)
 	return p
@@ -61,10 +62,31 @@ func (p *fakeProxy) delayFor(kind string) time.Duration {
 // sleep applies the configured delay, giving up as soon as the client hangs up
 // so a test that interrupts go does not wait out the delay at teardown.
 func (p *fakeProxy) sleep(r *http.Request, kind string) {
+	p.mu.Lock()
+	p.hits[kind]++
+	p.mu.Unlock()
+
 	select {
 	case <-time.After(p.delayFor(kind)):
 	case <-r.Context().Done():
 	}
+}
+
+// waitForHit blocks until a request of the given kind has arrived, which tells a
+// test that go is now in the middle of a command.
+func (p *fakeProxy) waitForHit(t *testing.T, kind string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		n := p.hits[kind]
+		p.mu.Unlock()
+		if n > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no %q request reached the proxy", kind)
 }
 
 func (p *fakeProxy) releases(module string) []release {

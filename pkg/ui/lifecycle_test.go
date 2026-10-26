@@ -328,10 +328,3 @@ func TestUpdateWorkerPanicRollsBack(t *testing.T) {
 		t.Errorf("go.mod left half-updated after a panic:\n%s", got)
 	}
 }
-
-func TestFindSafelyTurnsPanicIntoError(t *testing.T) {
-	info, err := findSafely(nil, "example.com/a", "v1.0.0", "1.25") // nil finder panics
-	if info != nil || err == nil || !strings.Contains(err.Error(), "internal error") {
-		t.Errorf("got (%v, %v), want an internal error", info, err)
-	}
-}
