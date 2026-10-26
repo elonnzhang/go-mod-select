@@ -14,6 +14,7 @@ import (
 
 	"go-mod-select/pkg/logger"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
 
@@ -42,11 +43,15 @@ func (ut UpdateType) String() string {
 	}
 }
 
-// metadataBatchSize is how many module@version specs are resolved per `go list`
-// invocation. Versions are scanned newest-first and the scan stops at the first
-// compatible one, so a small batch keeps the common case (latest version is
-// compatible) down to a single subprocess.
-const metadataBatchSize = 8
+// batchSizes is how many module@version specs are resolved per `go list`
+// invocation, in call order; the last entry repeats.
+//
+// `go list` resolves its arguments one after another, so a call costs about one
+// proxy round-trip per spec (measured cold: 1 spec 0.12s, 2 specs 0.26s, 8 specs
+// 0.80s). Starting small stops the common case — a compatible release near the
+// top — from paying for eight lookups to use one, while the growth caps the
+// subprocess count for modules whose recent releases all need a newer Go.
+var batchSizes = []int{2, 4, 8}
 
 // ModuleInfo contains information about a module and its available updates
 type ModuleInfo struct {
@@ -74,7 +79,11 @@ type ModuleMetadata struct {
 	Path      string `json:"Path"`
 	Version   string `json:"Version"`
 	GoVersion string `json:"GoVersion"`
-	Error     *struct {
+	// GoMod is the path of the module's cached go.mod for this version.
+	GoMod string `json:"GoMod,omitempty"`
+	// Versions is only populated when go list is run with -versions.
+	Versions []string `json:"Versions,omitempty"`
+	Error    *struct {
 		Err string `json:"Err"`
 	} `json:"Error,omitempty"`
 }
@@ -103,6 +112,10 @@ type Finder struct {
 	// ctx cancels in-flight subprocesses. Without it, quitting mid-analysis
 	// orphans a dozen `go list` processes still talking to the module proxy.
 	ctx context.Context
+
+	// runList replaces the `go list -m` subprocess; tests use it to count and
+	// script calls without a network.
+	runList func(args ...string) ([]byte, error)
 }
 
 // scratchGoMod is the minimal module file for the query sandbox. The go
@@ -158,6 +171,10 @@ func (f *Finder) workDir() string {
 // is captured separately so progress chatter ("go: downloading ...") cannot
 // corrupt parsed output.
 func (f *Finder) goList(args ...string) ([]byte, error) {
+	if f.runList != nil {
+		return f.runList(args...)
+	}
+
 	ctx := f.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -223,11 +240,18 @@ func (f *Finder) GetModuleInfo(modulePath, version string) (*ModuleMetadata, err
 // -e makes go list report per-module errors inline as JSON instead of aborting
 // the whole batch, so one retracted or deleted version cannot mask the others.
 func (f *Finder) getModuleInfoBatch(specs []string) ([]*ModuleMetadata, error) {
+	return f.getModuleInfoWith(nil, specs)
+}
+
+// getModuleInfoWith is getModuleInfoBatch with extra go list flags, e.g.
+// -versions.
+func (f *Finder) getModuleInfoWith(flags, specs []string) ([]*ModuleMetadata, error) {
 	if len(specs) == 0 {
 		return nil, nil
 	}
 
-	args := append([]string{"-e", "-json"}, specs...)
+	args := append([]string{"-e", "-json"}, flags...)
+	args = append(args, specs...)
 	output, err := f.goList(args...)
 	// With -e, a non-zero exit still yields usable JSON for the specs that
 	// resolved, so only give up when there is nothing to decode.
@@ -235,7 +259,35 @@ func (f *Finder) getModuleInfoBatch(specs []string) ([]*ModuleMetadata, error) {
 		return nil, fmt.Errorf("failed to resolve module metadata: %w", err)
 	}
 
-	return decodeModuleMetadata(bytes.NewReader(output))
+	metas, decodeErr := decodeModuleMetadata(bytes.NewReader(output))
+	for _, meta := range metas {
+		fillGoVersion(meta)
+	}
+	return metas, decodeErr
+}
+
+// fillGoVersion recovers a release's go directive from its cached go.mod when
+// go list omitted it.
+//
+// go list reports GoVersion only for releases the installed toolchain is able to
+// build; for one that declares a newer Go it prints no GoVersion at all (while
+// still naming the .mod file). Treating the missing field as "no directive"
+// would class exactly the releases that are too new as compatible.
+func fillGoVersion(meta *ModuleMetadata) {
+	if meta.GoVersion != "" || meta.Error != nil || meta.GoMod == "" {
+		return
+	}
+	data, err := os.ReadFile(meta.GoMod)
+	if err != nil {
+		logger.Log.Debug("cannot read cached go.mod", "path", meta.GoMod, "error", err.Error())
+		return
+	}
+	// Lax parsing: a dependency's go.mod may use syntax newer than x/mod knows.
+	file, err := modfile.ParseLax(meta.GoMod, data, nil)
+	if err != nil || file.Go == nil {
+		return
+	}
+	meta.GoVersion = file.Go.Version
 }
 
 // decodeModuleMetadata reads the concatenated JSON objects that `go list -json`
@@ -256,18 +308,64 @@ func decodeModuleMetadata(r io.Reader) ([]*ModuleMetadata, error) {
 	return metas, nil
 }
 
+// versionsWithLatest lists every published version of a module and, in the same
+// subprocess, resolves the metadata of its @latest release.
+//
+// The newest release is the one almost every module ends up proposing, so
+// fetching its go directive alongside the listing removes a whole subprocess
+// (and its proxy round-trips) from the common path. If the combined query yields
+// no version list — an unusual module or an older toolchain — it falls back to
+// the plain listing, and latest is nil.
+func (f *Finder) versionsWithLatest(modulePath string) ([]string, *ModuleMetadata, error) {
+	metas, err := f.getModuleInfoWith([]string{"-versions"}, []string{modulePath + "@latest"})
+	if err == nil && len(metas) == 1 && len(metas[0].Versions) > 0 {
+		var latest *ModuleMetadata
+		if metas[0].Error == nil && metas[0].Version != "" {
+			latest = metas[0]
+		}
+		return metas[0].Versions, latest, nil
+	}
+
+	versions, err := f.ListVersions(modulePath)
+	return versions, nil, err
+}
+
+// resolveBatch fetches metadata for up to size not-yet-seen versions from the
+// front of from, recording them in metas. Every requested version is marked in
+// attempted, so one that fails to resolve is not requested again.
+func (f *Finder) resolveBatch(modulePath string, from []string, size int, metas map[string]*ModuleMetadata, attempted map[string]bool) {
+	var specs []string
+	for _, ver := range from {
+		if len(specs) == size {
+			break
+		}
+		if _, known := metas[ver]; known || attempted[ver] {
+			continue
+		}
+		attempted[ver] = true
+		specs = append(specs, modulePath+"@"+ver)
+	}
+
+	got, err := f.getModuleInfoBatch(specs)
+	if err != nil {
+		logger.Log.Debug("metadata batch failed", "module", modulePath, "error", err.Error())
+	}
+	// A truncated stream still yields the entries decoded before the break;
+	// versions that never made it in are counted as unresolved when reached.
+	// Index by version rather than trusting positional order.
+	for _, meta := range got {
+		metas[meta.Version] = meta
+	}
+}
+
 // FindCompatibleVersions finds the newest published version of a module that
 // can be built with the target Go version.
 //
 // Versions are inspected newest-first and the scan stops at the first
 // compatible hit, which avoids resolving metadata for the long tail of old
-// releases nobody will pick.
-// FindCompatibleVersions finds the newest published version of a module that
-// can be built with the target Go version.
-//
-// Versions are inspected newest-first in batches and the scan stops at the
-// first compatible hit, so the common case (the latest release works) costs a
-// single subprocess instead of one per published version.
+// releases nobody will pick. The listing call already resolves @latest, so the
+// common case (the newest release works) costs a single subprocess; otherwise
+// further candidates are resolved in growing batches (see batchSizes).
 //
 // Note that `go list -m -versions` only reports versions under the given
 // module path, and Go puts v2+ behind a /vN suffix. A v1 dependency therefore
@@ -283,7 +381,7 @@ func (f *Finder) FindCompatibleVersions(modulePath, currentVersion, targetGoVers
 		currentVersion = "v" + currentVersion
 	}
 
-	allVersions, err := f.ListVersions(modulePath)
+	allVersions, latest, err := f.versionsWithLatest(modulePath)
 	if err != nil {
 		return nil, err
 	}
@@ -298,84 +396,74 @@ func (f *Finder) FindCompatibleVersions(modulePath, currentVersion, targetGoVers
 	semver.Sort(candidates)
 	reverse(candidates)
 
+	metas := make(map[string]*ModuleMetadata, len(candidates))
+	if latest != nil {
+		metas[latest.Version] = latest
+	}
+	attempted := make(map[string]bool)
+
 	blockedNewer := 0
 	unresolvedNewer := 0
-	for start := 0; start < len(candidates); start += metadataBatchSize {
-		end := min(start+metadataBatchSize, len(candidates))
-		batch := candidates[start:end]
-
-		specs := make([]string, len(batch))
-		for i, ver := range batch {
-			specs[i] = modulePath + "@" + ver
+	batches := 0
+	for i, ver := range candidates {
+		if _, known := metas[ver]; !known && !attempted[ver] {
+			size := batchSizes[min(batches, len(batchSizes)-1)]
+			batches++
+			f.resolveBatch(modulePath, candidates[i:], size, metas, attempted)
 		}
 
-		metas, err := f.getModuleInfoBatch(specs)
-		if err != nil {
-			logger.Log.Debug("metadata batch failed", "module", modulePath, "error", err.Error())
-			unresolvedNewer += len(batch)
+		meta, ok := metas[ver]
+		if !ok || meta.Error != nil {
+			// A retracted tag, a private module, or a flaky proxy. This is
+			// NOT the same as "needs a newer Go" and must not be counted as
+			// such: doing so let an unresolvable newest version masquerade
+			// as a Go-version conflict and produced a bogus downgrade.
+			unresolvedNewer++
+			continue
+		}
+		if !GoVersionSatisfied(meta.GoVersion, targetGoVersion) {
+			blockedNewer++
 			continue
 		}
 
-		// Index by version rather than trusting positional order.
-		byVersion := make(map[string]*ModuleMetadata, len(metas))
-		for _, meta := range metas {
-			byVersion[meta.Version] = meta
-		}
+		isDowngrade := currentVersion != "" && semver.Compare(ver, currentVersion) < 0
 
-		for _, ver := range batch {
-			meta, ok := byVersion[ver]
-			if !ok || meta.Error != nil {
-				// A retracted tag, a private module, or a flaky proxy. This is
-				// NOT the same as "needs a newer Go" and must not be counted as
-				// such: doing so let an unresolvable newest version masquerade
-				// as a Go-version conflict and produced a bogus downgrade.
-				unresolvedNewer++
-				continue
-			}
-			if !GoVersionSatisfied(meta.GoVersion, targetGoVersion) {
-				blockedNewer++
-				continue
-			}
-
-			isDowngrade := currentVersion != "" && semver.Compare(ver, currentVersion) < 0
-
-			// Every unresolved candidate was newer than this one (the walk is
-			// newest-first). Proposing a downgrade past versions we simply
-			// could not read would assert "your pinned version needs a newer
-			// Go" — the documented meaning of ↓ — without having established
-			// it. Report the resolution failure instead.
-			if isDowngrade && unresolvedNewer > 0 {
-				logger.Log.Warn("refusing to propose a downgrade past unresolved versions",
-					"module", modulePath,
-					"current", currentVersion,
-					"candidate", ver,
-					"unresolved_newer", unresolvedNewer)
-				return nil, fmt.Errorf(
-					"could not resolve %d version(s) of %s newer than %s; only older versions resolved, so no update is proposed",
-					unresolvedNewer, modulePath, currentVersion)
-			}
-
-			info := &ModuleInfo{
-				Path:             modulePath,
-				CurrentVersion:   currentVersion,
-				LatestCompatible: ver,
-				UpdateType:       DetermineUpdateType(currentVersion, ver),
-				Downgrade:        isDowngrade,
-				BlockedNewer:     blockedNewer,
-				UnresolvedNewer:  unresolvedNewer,
-			}
-
-			logger.Log.Info("found compatible version",
+		// Every unresolved candidate was newer than this one (the walk is
+		// newest-first). Proposing a downgrade past versions we simply
+		// could not read would assert "your pinned version needs a newer
+		// Go" — the documented meaning of ↓ — without having established
+		// it. Report the resolution failure instead.
+		if isDowngrade && unresolvedNewer > 0 {
+			logger.Log.Warn("refusing to propose a downgrade past unresolved versions",
 				"module", modulePath,
 				"current", currentVersion,
-				"latest", ver,
-				"update_type", info.UpdateType.String(),
-				"downgrade", info.Downgrade,
-				"blocked_newer", blockedNewer,
+				"candidate", ver,
 				"unresolved_newer", unresolvedNewer)
-
-			return info, nil
+			return nil, fmt.Errorf(
+				"could not resolve %d version(s) of %s newer than %s; only older versions resolved, so no update is proposed",
+				unresolvedNewer, modulePath, currentVersion)
 		}
+
+		info := &ModuleInfo{
+			Path:             modulePath,
+			CurrentVersion:   currentVersion,
+			LatestCompatible: ver,
+			UpdateType:       DetermineUpdateType(currentVersion, ver),
+			Downgrade:        isDowngrade,
+			BlockedNewer:     blockedNewer,
+			UnresolvedNewer:  unresolvedNewer,
+		}
+
+		logger.Log.Info("found compatible version",
+			"module", modulePath,
+			"current", currentVersion,
+			"latest", ver,
+			"update_type", info.UpdateType.String(),
+			"downgrade", info.Downgrade,
+			"blocked_newer", blockedNewer,
+			"unresolved_newer", unresolvedNewer)
+
+		return info, nil
 	}
 
 	// Distinguish "the target Go rules everything out" from "we could not read
