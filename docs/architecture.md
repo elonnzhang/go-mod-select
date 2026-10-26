@@ -81,7 +81,9 @@ SameGoLanguageVersion(a, b string) bool
 
 *沙箱查询*：所有 `go list` 都在一个临时的最小模块里执行，而不是用户的项目目录。就地查询只有两个都不好的选项——`-mod=mod` 会在只读分析期间改写用户的 go.mod/go.sum；`-mod=readonly` 一旦问到不在 build list 里的版本就直接报 `updates to go.sum needed` 而失败。沙箱两者都能避开。
 
-*批量 + 命中即停*：版本从新到旧按批（每批 8 个）用 `go list -m -e -json` 查询，找到第一个兼容版本就返回。`-e` 让单个失败版本以内联 Error 字段出现，不会中断整批。绝大多数情况最新版就兼容，因此每个模块只需一次 `-versions` 加一次元数据查询。
+*合并查询 + 渐进批量 + 命中即停*：先用一次 `go list -m -e -json -versions <mod>@latest` 同时拿到全部已发布版本和 `@latest` 的 go 指令；最新版兼容（绝大多数情况）时，一个模块只花这一次子进程调用。否则从新到旧按 2、4、8 的递增批量继续用 `go list -m -e -json` 查询，找到第一个兼容版本就返回。`-e` 让单个失败版本以内联 Error 字段出现，不会中断整批。批量从小开始是因为 `go list` 对多个参数是**顺序**解析的（冷缓存实测：1 个 0.12s、2 个 0.26s、8 个 0.80s），为了用上第一个而一口气解析 8 个并不划算。若合并查询拿不到版本列表（罕见模块或旧工具链），回退到单独的 `-versions` 调用。
+
+*go 指令的读取*：`go list` 对 go 指令高于本机工具链的版本不返回 `GoVersion`，只给出缓存 `.mod` 的路径。`fillGoVersion` 在字段缺失时解析该文件，否则这类版本会被当成"没有 go 指令"而判为兼容。
 
 *版本比较*：Go 版本用 `go/version` 而非 `semver` 比较。`semver` 无法正确解析 `1.21rc1` 这类 Go 特有写法，且对非法输入返回 0（会被误判为"相等即兼容"）。比较前把 `1.21` 补成 `1.21.0`，因为 `go/version` 把裸的 `go1.21`（语言版本）排在 `go1.21.0` 之前。
 
@@ -279,7 +281,10 @@ type AppModel struct {
     goVersionMatched   bool
 
     // UI 组件
-    viewport, detailViewport viewport.Model
+    detailViewport viewport.Model         // 仅详情弹窗使用；模块列表自己做窗口化
+    listTop int                           // 列表可见窗口的首行；只渲染窗口内的行
+    pathCol int                           // 路径列宽，随标签页与终端宽度调整
+    styles  *styleSet                     // 启动时按主题一次性构建的样式
     spinner  spinner.Model
     progress progress.Model
 
@@ -287,7 +292,11 @@ type AppModel struct {
 }
 ```
 
-派生状态刻意不缓存：`countSelected()`、`getVisibleUpdateModules()`、`updatedModules()` 每次渲染重算。列表规模是几十到几百，重算的成本远低于缓存失效带来的 bug。
+派生状态刻意不缓存：`countSelected()`、`visibleIndices()`、`updatedModules()` 每次渲染重算。列表规模是几十到几百，重算的成本远低于缓存失效带来的 bug。
+
+*窗口化渲染*：模块列表只渲染屏幕上可见的那几行（`renderModuleList`），而不是把整张列表交给 viewport 再滚动。按一次方向键的代价因此与模块总数无关（300 个模块：1.0 ms → 0.22 ms，内存分配 1.19 MB → 0.22 MB；没有过滤时耗时与列表长度无关，生效的过滤每次按键多一遍 O(n) 路径匹配，300 个模块约 +40µs）。过滤对四个标签页统一生效，光标是**过滤后列表**里的位置，经 `selectedIndex()` 映射回各标签页的底层条目。
+
+*样式缓存*：lipgloss 样式在 `styleSet` 里按主题构建一次。此前列表和日志面板每次重绘都会创建数百个临时样式，分析日志还会每行重建一张 map。
 
 ### 消息
 
@@ -309,6 +318,10 @@ KeyMsg → handleKeyPress() → 按 currentScreen 分派 → 更新 Model → Vi
 ```
 
 按键判定顺序很关键：`Ctrl+C`（全局）→ 弹窗 → **过滤输入** → 命令绑定。过滤输入必须排在命令绑定之前，否则输入模块名里的 `q` 会退出程序。
+
+`Ctrl+C` 在更新页是**取消**而不是退出：直接退出会让 `go get` 在无人监管下继续改写 go.mod，且没有回滚。第一次按下通过 context 中断子进程（先 SIGINT，5 秒后才 SIGKILL），updater 照常回滚并返回 `ErrCancelled`；第二次才真正退出。
+
+退出时 `TUI()` 在关闭 `quit` 之后会等待后台 worker 收尾（最多 10 秒）：删除沙箱目录、终止 `go list` 子进程、完成回滚。此前它关闭信号后立即返回，进程在 worker 的 `defer` 跑完之前就退出了。
 
 日志条目以 `[STATUS]pkg` 的形式存储，而不是预渲染好的带色文本。这样窗口尺寸变化时能重新上色，也让完成状态可以就地替换自己的 `[CHECKING]` 占位行。
 
@@ -332,10 +345,12 @@ main
 
 ## 性能优化
 
-1. **批量元数据查询 + 命中即停** - 每模块通常两次子进程调用，而不是"每个已发布版本一次"。本项目上 `--dry-run` 从 16.0s 降到 0.21s
+1. **合并查询 + 渐进批量 + 命中即停** - 最新版兼容时每模块只需一次子进程调用，而不是"每个已发布版本一次"。本项目上 `--dry-run` 从 16.0s 降到 0.21s；24 个直接依赖、冷模块缓存的合成 go.mod 上，子进程 46 → 29，元数据解析 167 → 6 个版本，`--dry-run` 中位耗时约 2.4s → 1.1s
 2. **有界并发** - 12 个 worker，避免进程爆炸和 proxy 限流
 3. **异步详情** - `go mod why` 和源码遍历不阻塞事件循环
 4. **增量更新** - 只更新选中的模块；已应用的模块不会在第二轮重复 `go get`
+5. **窗口化列表 + 样式缓存** - 按键代价只与可见行数有关
+6. **spinner 只在分析页转** - 其他页面不再每秒重绘十次
 
 ## 已知限制
 
