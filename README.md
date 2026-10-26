@@ -102,7 +102,7 @@ go-mod-select 1.25 --verbose
 
 ```
 ~/.go-mod-select/
-├── app.log        # JSON 格式日志（全部级别，追加写入）
+├── app.log        # JSON 格式日志（全部级别，追加写入；满 5 MB 时轮转为 app.log.1）
 └── colors.json    # TUI 颜色配置（首次运行自动创建）
 ```
 

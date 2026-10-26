@@ -11,6 +11,19 @@ import (
 // code (and tests that never call Init) cannot nil-panic on a log call.
 var Log = slog.New(slog.NewJSONHandler(io.Discard, nil))
 
+// maxLogBytes is how large the log may be when the program starts before it is
+// moved aside. The file is opened for append at DEBUG level on every run and
+// holds each go command's stderr, so without a cap it only ever grows.
+const maxLogBytes = 5 << 20
+
+// rotate keeps one previous generation (path + ".1"), replacing any older one.
+// Best effort: if the rename fails the log simply keeps growing.
+func rotate(path string) {
+	if info, err := os.Stat(path); err == nil && info.Size() >= maxLogBytes {
+		os.Rename(path, path+".1")
+	}
+}
+
 // Init initializes the logger with file output
 func Init(logPath string) error {
 	// Create log directory if it doesn't exist
@@ -18,6 +31,8 @@ func Init(logPath string) error {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return err
 	}
+
+	rotate(logPath)
 
 	// Open log file
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
