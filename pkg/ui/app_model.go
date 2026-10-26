@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"go-mod-select/pkg/config"
 	"go-mod-select/pkg/finder"
@@ -58,6 +60,7 @@ type AppModel struct {
 
 	// Color configuration
 	colors *config.ColorConfig
+	styles *styleSet // built once from colors; see st()
 
 	// Selection screen state
 	updateModules   []*SelectableModule // Modules with available updates (can select)
@@ -65,13 +68,17 @@ type AppModel struct {
 	indirectModules []parser.Require    // Current indirect requires (read-only)
 	replaceModules  []ReplaceInfo       // Current replace directives (read-only)
 	currentTab      tabType
-	cursor          int
-	viewport        viewport.Model
+	cursor          int  // position within the filtered list of the active tab
+	listTop         int  // position of the first visible row; only the visible window is rendered
+	pathCol         int  // width of the module-path column, fitted to the active tab
+	hideNote        bool // the "newer need a later Go" note does not fit the terminal width
+	hideCurrent     bool // not even "old → new" fits, so rows show only the new version
 	filterMode      bool
 	filterInput     string
 	showingDetail   bool           // Whether showing detail popup
 	detailContent   string         // Content of detail popup
 	detailModule    string         // Module the popup describes, to drop stale async results
+	detailSeq       int            // Bumped per popup opening, so a reopened popup ignores the earlier load
 	detailViewport  viewport.Model // Viewport for scrollable detail popup
 
 	// Progress state
@@ -84,12 +91,13 @@ type AppModel struct {
 	analyzingLogFollow bool   // Auto-scroll to newest log until the user scrolls up
 	currentModule      int
 	totalModules       int
-	tidySucceeded      bool   // go mod tidy reported success in this update run
-	tidyRunning        bool   // go mod tidy is in flight (not a per-module step)
-	updateFailed       bool   // at least one step of the update run failed
-	updateError        error  // why the update run failed, if it did
-	actualGoVersion    string // go directive found on disk after the update
-	goVersionMatched   bool   // whether that matches what was requested
+	updatedBefore      map[string]bool // modules already applied when this run started; a rollback must not un-apply them
+	tidySucceeded      bool            // go mod tidy reported success in this update run
+	tidyRunning        bool            // go mod tidy is in flight (not a per-module step)
+	updateFailed       bool            // at least one step of the update run failed
+	updateError        error           // why the update run failed, if it did
+	actualGoVersion    string          // go directive found on disk after the update
+	goVersionMatched   bool            // whether that matches what was requested
 
 	// Update subscription
 	updateSub chan tea.Msg // Channel for receiving update progress
@@ -101,6 +109,16 @@ type AppModel struct {
 	// select on it so they never block sending to a channel nobody reads.
 	quit chan struct{}
 
+	// workers counts running background workers so TUI can wait for their
+	// cleanup (scratch directory removal, rollback) before the process exits.
+	// A pointer, because the model is copied on every Update.
+	workers *sync.WaitGroup
+
+	// cancelUpdate interrupts the update run in flight; cancelling is set once
+	// the user has asked for that and the rollback is under way.
+	cancelUpdate context.CancelFunc
+	cancelling   bool
+
 	// Logs - separate logs for different screens
 	analysisLogs  []string // Full logs for analysis screen (all logs, scrollable)
 	operationLogs []string // Operation logs for selection screen (last 3 only)
@@ -109,7 +127,6 @@ type AppModel struct {
 	// UI dimensions
 	width  int
 	height int
-	ready  bool
 }
 
 type ReplaceInfo struct {
@@ -148,10 +165,12 @@ type updateProgressMsg struct {
 
 // updateCompleteMsg ends an update run. actualGoVersion is the go directive
 // found on disk afterwards, which `go mod tidy` may have raised above the
-// requested one.
+// requested one. refreshed is go.mod re-read after a successful run, so the
+// read-only tabs show what is on disk now rather than what was there at startup.
 type updateCompleteMsg struct {
 	actualGoVersion  string
 	goVersionMatched bool
+	refreshed        *parser.GoMod
 }
 
 // updateFailedMsg carries the reason an update run aborted. The updater has
@@ -163,6 +182,7 @@ type updateFailedMsg struct{ err error }
 type detailLoadedMsg struct {
 	module string
 	body   string
+	seq    int // detailSeq of the popup that asked for it
 }
 
 type startUpdateMsg struct {
@@ -199,19 +219,35 @@ func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot st
 		goMod:           goMod,
 		projectRoot:     projectRoot,
 		colors:          colors,
+		styles:          newStyleSet(colors),
 		spinner:         s,
 		progress:        p,
 		analysisLogs:    []string{},
 		operationLogs:   []string{},
 		updateLogs:      []string{},
 		quit:            make(chan struct{}),
+		workers:         &sync.WaitGroup{},
 		currentTab:      tabUpdate, // Start with Update tab
 	}
 }
 
-// Implement the tea.Model interface
+// Init implements tea.Model. The spinner is started when analysis begins; it is
+// not visible on the welcome screen, so ticking before then only forces redraws.
 func (m AppModel) Init() tea.Cmd {
-	return m.spinner.Tick
+	return nil
+}
+
+// spawn runs fn as a tracked background worker; TUI waits for it on exit.
+func (m AppModel) spawn(fn func()) {
+	if m.workers == nil {
+		go fn()
+		return
+	}
+	m.workers.Add(1)
+	go func() {
+		defer m.workers.Done()
+		fn()
+	}()
 }
 
 // Implement the tea.Model interface
@@ -220,17 +256,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-
-		if !m.ready && m.currentScreen == screenSelection {
-			m.viewport = viewport.New(msg.Width, m.getViewportHeight())
-			m.viewport.YPosition = m.getHeaderHeight()
-			m.ready = true
-			m.updateViewport()
-		} else if m.ready {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = m.getViewportHeight()
-			m.updateViewport()
-		}
+		m.fitColumns()
+		m.clampList()
 
 		// An open popup must be resized too, or the border is drawn at the new
 		// width around content laid out for the old one.
@@ -238,7 +265,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			w, h := m.detailViewportSize()
 			m.detailViewport.Width = w
 			m.detailViewport.Height = h
-			m.detailViewport.SetContent(m.detailContent)
+			m.setDetailContent()
 		}
 		return m, nil
 
@@ -246,14 +273,19 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKeyPress(msg)
 
 	case startAnalysisMsg:
-		m.analysisSub = make(chan tea.Msg)
-		go startAnalysisWorker(msg, m.analysisSub, m.quit)
-		return m, waitForAnalysisMsg(m.analysisSub)
+		sub, quit := make(chan tea.Msg), m.quit
+		m.analysisSub = sub
+		m.spawn(func() { startAnalysisWorker(msg, sub, quit) })
+		return m, waitForAnalysisMsg(sub)
 
 	case startUpdateMsg:
-		m.updateSub = make(chan tea.Msg)
-		go startUpdateWorker(msg, m.updateSub, m.quit)
-		return m, waitForUpdateMsg(m.updateSub)
+		sub, quit := make(chan tea.Msg), m.quit
+		ctx, cancel := context.WithCancel(context.Background())
+		m.updateSub = sub
+		m.cancelUpdate = cancel
+		m.cancelling = false
+		m.spawn(func() { startUpdateWorker(ctx, cancel, msg, sub, quit) })
+		return m, waitForUpdateMsg(sub)
 
 	case analyzeCompleteMsg:
 		// Drop the reference rather than close(): the worker is the only sender
@@ -344,9 +376,23 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateFailedMsg:
 		m.updateFailed = true
 		m.updateError = msg.err
-		m.updateLogs = append(m.updateLogs,
-			fmt.Sprintf("✗ %v", msg.err),
-			"↩ go.mod and go.sum restored to their previous contents")
+		restored := "↩ go.mod and go.sum restored to their previous contents"
+		if !rolledBack(msg.err) {
+			restored = "⚠ rollback incomplete — check go.mod and go.sum by hand"
+		}
+		if wasCancelled(msg.err) {
+			m.updateLogs = append(m.updateLogs, "⏹ update cancelled")
+		} else {
+			// A go failure carries its whole stderr; one log row per line, capped,
+			// because a multi-line entry would overflow the fixed-height pane.
+			for i, row := range errorLines(msg.err, 6, max(m.width-14, 20)) {
+				if i == 0 {
+					row = "✗ " + row
+				}
+				m.updateLogs = append(m.updateLogs, row)
+			}
+		}
+		m.updateLogs = append(m.updateLogs, restored)
 
 		if m.updateSub != nil {
 			return m, waitForUpdateMsg(m.updateSub)
@@ -356,14 +402,22 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateCompleteMsg:
 		// Drop the reference rather than close() — see analyzeCompleteMsg.
 		m.updateSub = nil
+		m.cancelUpdate = nil
+		m.cancelling = false
 		m.actualGoVersion = msg.actualGoVersion
 		m.goVersionMatched = msg.goVersionMatched
 		if m.updateFailed {
-			// A rollback undid every applied version, so nothing may be shown
-			// as updated on the summary screen.
+			// The rollback undid this run's versions, so none of them may be
+			// shown as updated. Modules applied by an earlier, successful run
+			// are still in go.mod: the snapshot was taken after them.
 			for _, mod := range m.updateModules {
-				mod.Updated = false
+				mod.Updated = m.updatedBefore[mod.Info.Path]
 			}
+		}
+		if msg.refreshed != nil {
+			m.goMod = msg.refreshed
+			m.requireModules, m.indirectModules = splitRequires(m.goMod.Requires)
+			m.replaceModules = replaceInfos(m.goMod)
 		}
 		m.currentScreen = screenComplete
 		return m, nil
@@ -371,14 +425,20 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case detailLoadedMsg:
 		// Discard a late result for a popup the user has already closed or
 		// moved on from.
-		if !m.showingDetail || msg.module != m.detailModule {
+		if !m.showingDetail || msg.module != m.detailModule || msg.seq != m.detailSeq {
 			return m, nil
 		}
 		m.detailContent = strings.TrimSuffix(m.detailContent, detailLoadingNotice) + msg.body
-		m.detailViewport.SetContent(m.detailContent)
+		m.setDetailContent()
 		return m, nil
 
 	case spinner.TickMsg:
+		// Only the analyzing screen draws the spinner. Letting the tick chain
+		// lapse elsewhere stops ten pointless redraws a second; entering the
+		// analyzing screen starts a fresh chain.
+		if m.currentScreen != screenAnalyzing {
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
@@ -398,6 +458,16 @@ func (m AppModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// selection screen it has to reach the filter input, where it is a literal
 	// character, not a command.
 	if key.Matches(msg, keys.ForceQuit) {
+		// Quitting while `go get` is rewriting go.mod would leave a half-applied
+		// update behind with no rollback and the subprocess still running. The
+		// first Ctrl+C therefore cancels the run, which rolls back and lands on
+		// the summary; a second one quits regardless.
+		if m.currentScreen == screenUpdating && m.cancelUpdate != nil && !m.cancelling {
+			m.cancelling = true
+			m.cancelUpdate()
+			m.updateLogs = append(m.updateLogs, "⏹ Cancelling — restoring go.mod and go.sum…")
+			return m, nil
+		}
 		return m, tea.Quit
 	}
 
@@ -454,13 +524,17 @@ func (m AppModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.analyzingLogOffset = m.maxAnalyzingLogOffset()
 			m.analyzingLogFollow = true
 			return m, nil
+		case key.Matches(msg, keys.Home):
+			m.analyzingLogOffset = 0
+			m.analyzingLogFollow = m.maxAnalyzingLogOffset() == 0
+			return m, nil
 		}
 
 	case screenSelection:
 		return m.handleSelectionInput(msg)
 
 	case screenUpdating:
-		// The update is mutating go.mod; only a hard interrupt is honoured.
+		// The update is mutating go.mod; only Ctrl+C (handled above) is honoured.
 		return m, nil
 
 	case screenComplete:
@@ -478,10 +552,11 @@ func (m AppModel) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			m.currentScreen = screenSelection
 			m.cursor = 0
+			m.listTop = 0
 			m.currentTab = tabUpdate
 			m.updateError = nil
 			m.updateFailed = false
-			m.updateViewport()
+			m.fitColumns()
 			return m, nil
 		}
 	}
@@ -493,7 +568,8 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// If showing detail popup, handle scrolling and closing
 	if m.showingDetail {
 		switch {
-		case key.Matches(msg, keys.Esc), key.Matches(msg, keys.Quit):
+		case key.Matches(msg, keys.Esc), key.Matches(msg, keys.Quit),
+			key.Matches(msg, keys.Space), key.Matches(msg, keys.Enter):
 			m.showingDetail = false
 			m.detailContent = ""
 			m.detailModule = ""
@@ -509,6 +585,12 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case key.Matches(msg, keys.PageDown):
 			m.detailViewport.HalfPageDown()
+			return m, nil
+		case key.Matches(msg, keys.Home):
+			m.detailViewport.GotoTop()
+			return m, nil
+		case key.Matches(msg, keys.End):
+			m.detailViewport.GotoBottom()
 			return m, nil
 		}
 		// Ignore other keys when showing detail
@@ -543,42 +625,37 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 
 			m.currentScreen = screenUpdating
+			m.updatedBefore = m.updatedPaths()
 			m.updateLogs = nil
 			m.tidySucceeded = false
 			m.tidyRunning = false
 			m.updateFailed = false
+			m.updateError = nil
 			m.currentModule = 0
 			m.totalModules = 0
 			return m, m.performUpdate()
 		}
+		m.addOperationLog("Enter applies updates — press Tab to reach the Update tab")
 
 	case key.Matches(msg, keys.Esc):
 		// Clear an applied filter without re-entering filter mode.
 		if m.filterInput != "" {
 			m.filterInput = ""
-			m.cursor = 0
+			m.resetList()
 			m.addOperationLog("Filter cleared")
-			m.updateViewport()
 		}
 
 	case key.Matches(msg, keys.Tab):
-		m.currentTab = (m.currentTab + 1) % tabCount
-		m.cursor = 0
-		m.viewport.GotoTop()
-		m.updateViewport()
+		m.switchTab((m.currentTab + 1) % tabCount)
 
 	case key.Matches(msg, keys.ShiftTab):
-		m.currentTab = (m.currentTab + tabCount - 1) % tabCount
-		m.cursor = 0
-		m.viewport.GotoTop()
-		m.updateViewport()
+		m.switchTab((m.currentTab + tabCount - 1) % tabCount)
 
 	case key.Matches(msg, keys.Filter):
 		m.filterMode = true
 		m.filterInput = ""
-		m.cursor = 0
-		m.addOperationLog("Filter mode - type to search, Enter to apply")
-		m.updateViewport()
+		m.resetList()
+		m.addOperationLog("Filter mode - type to search, ↑↓ to move, Enter to apply")
 
 	case key.Matches(msg, keys.SelectAll):
 		if canSelect {
@@ -587,12 +664,11 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Space):
 		if canSelect {
-			visible := m.getVisibleUpdateModules()
-			if m.cursor < 0 || m.cursor >= len(visible) {
+			idx, ok := m.selectedIndex()
+			if !ok {
 				return m, nil
 			}
-			actualIdx := visible[m.cursor]
-			mod := m.updateModules[actualIdx]
+			mod := m.updateModules[idx]
 
 			if mod.Updated {
 				m.addOperationLog(fmt.Sprintf("Already updated: %s", mod.Info.Path))
@@ -605,7 +681,6 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				status = "deselected"
 			}
 			m.addOperationLog(fmt.Sprintf("%s: %s", status, mod.Info.Path))
-			m.updateViewport()
 		} else {
 			header, ok := m.detailHeader()
 			if !ok {
@@ -614,6 +689,7 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 			// Render the header immediately and fill in the slow part when it
 			// arrives, so opening a popup never blocks the event loop.
+			m.detailSeq++
 			load := m.loadDetailBody()
 			m.detailModule = m.detailSubject()
 			m.detailContent = header
@@ -622,52 +698,30 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.showingDetail = true
 
-			// Match renderDetailPopup's geometry: border (2) + horizontal
-			// padding (4), border (2) + vertical padding (2), plus one line
-			// for the help text below the box.
 			w, h := m.detailViewportSize()
 			m.detailViewport = viewport.New(w, h)
-			m.detailViewport.SetContent(m.detailContent)
+			m.setDetailContent()
 
-			return m, m.loadDetailBody()
+			return m, load
 		}
 
 	case key.Matches(msg, keys.Up):
-		if m.cursor > 0 {
-			m.cursor--
-			m.updateViewport()
-			m.syncViewportToCursor()
-		}
+		m.moveCursor(m.cursor - 1)
 
 	case key.Matches(msg, keys.Down):
-		if m.cursor < m.getMaxCursor() {
-			m.cursor++
-			m.updateViewport()
-			m.syncViewportToCursor()
-		}
+		m.moveCursor(m.cursor + 1)
 
 	case key.Matches(msg, keys.PageUp):
-		m.cursor = max(0, m.cursor-10)
-		m.updateViewport()
-		m.syncViewportToCursor()
+		m.moveCursor(m.cursor - m.pageSize())
 
 	case key.Matches(msg, keys.PageDown):
-		// max(0, …) matters on an empty tab, where getMaxCursor() is -1: a
-		// cursor of -1 sticks (Up needs >0, Down needs <-1) and would index
-		// out of range if any consumer trusted it.
-		m.cursor = max(0, min(m.getMaxCursor(), m.cursor+10))
-		m.updateViewport()
-		m.syncViewportToCursor()
+		m.moveCursor(m.cursor + m.pageSize())
 
 	case key.Matches(msg, keys.Home):
-		m.cursor = 0
-		m.updateViewport()
-		m.syncViewportToCursor()
+		m.moveCursor(0)
 
 	case key.Matches(msg, keys.End):
-		m.cursor = max(0, m.getMaxCursor())
-		m.updateViewport()
-		m.syncViewportToCursor()
+		m.moveCursor(m.getMaxCursor())
 	}
 
 	return m, nil
@@ -676,7 +730,7 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // toggleAllVisible selects every filtered, not-yet-updated module — or clears
 // them all if any are already selected, so the key is its own undo.
 func (m *AppModel) toggleAllVisible() {
-	visible := m.getVisibleUpdateModules()
+	visible := m.visibleIndices()
 
 	anySelected := false
 	for _, idx := range visible {
@@ -704,17 +758,19 @@ func (m *AppModel) toggleAllVisible() {
 	} else {
 		m.addOperationLog(fmt.Sprintf("Selected %d module(s)", changed))
 	}
-	m.updateViewport()
 }
 
+// handleFilterInput edits the filter live: the list narrows with every key. The
+// arrow and page keys keep working while typing — j/k are literal characters
+// here, but the arrows are not — so a match can be reached without leaving the
+// filter first.
 func (m AppModel) handleFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.filterMode = false
 		m.filterInput = ""
-		m.cursor = 0
+		m.resetList()
 		m.addOperationLog("Filter cancelled")
-		m.updateViewport()
 
 	case "enter":
 		m.filterMode = false
@@ -723,8 +779,19 @@ func (m AppModel) handleFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.addOperationLog(fmt.Sprintf("Filter: '%s'", m.filterInput))
 		}
-		m.cursor = 0
-		m.updateViewport()
+
+	case "up":
+		m.moveCursor(m.cursor - 1)
+	case "down":
+		m.moveCursor(m.cursor + 1)
+	case "pgup":
+		m.moveCursor(m.cursor - m.pageSize())
+	case "pgdown":
+		m.moveCursor(m.cursor + m.pageSize())
+
+	case "ctrl+u":
+		m.filterInput = ""
+		m.resetList()
 
 	case "backspace":
 		if m.filterInput != "" {
@@ -732,19 +799,16 @@ func (m AppModel) handleFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// characters, and lopping off a single byte would corrupt them.
 			runes := []rune(m.filterInput)
 			m.filterInput = string(runes[:len(runes)-1])
-			m.cursor = 0
-			m.updateViewport()
+			m.resetList()
 		}
 
 	default:
 		if msg.Type == tea.KeyRunes {
 			m.filterInput += string(msg.Runes)
-			m.cursor = 0
-			m.updateViewport()
+			m.resetList()
 		} else if msg.Type == tea.KeySpace {
 			m.filterInput += " "
-			m.cursor = 0
-			m.updateViewport()
+			m.resetList()
 		}
 	}
 
@@ -773,80 +837,22 @@ func (m AppModel) View() string {
 	return ""
 }
 
-// Style helpers - get configured styles
-func (m AppModel) titleStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Bold(true).
-		Foreground(m.colors.ToLipglossColor(m.colors.Title)).
-		Padding(0, 1)
-}
-
-func (m AppModel) headerStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(m.colors.ToLipglossColor(m.colors.Border)).
-		Padding(0, 1).
-		Bold(true)
-}
-
-func (m AppModel) tabActiveStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Bold(true).
-		Foreground(m.colors.ToLipglossColor(m.colors.TabActive)).
-		Background(m.colors.ToLipglossColor(m.colors.TabBackground)).
-		Padding(0, 2)
-}
-
-func (m AppModel) tabInactiveStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(m.colors.ToLipglossColor(m.colors.TabInactive)).
-		Padding(0, 2)
-}
-
-func (m AppModel) helpStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(m.colors.ToLipglossColor(m.colors.Help))
-}
-
-func (m AppModel) cursorStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(m.colors.ToLipglossColor(m.colors.Cursor))
-}
-
-func (m AppModel) selectedStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(m.colors.ToLipglossColor(m.colors.Selected)).
-		Bold(true)
-}
-
-func (m AppModel) infoStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(m.colors.ToLipglossColor(m.colors.Info)).
-		Bold(true)
-}
-
-func (m AppModel) successStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(m.colors.ToLipglossColor(m.colors.Success)).
-		Bold(true)
-}
-
-func (m AppModel) logStyle() lipgloss.Style {
-	return lipgloss.NewStyle().
-		Foreground(m.colors.ToLipglossColor(m.colors.Log))
-}
+// Style accessors read from the cached styleSet; see app_styles.go.
+func (m AppModel) titleStyle() lipgloss.Style       { return m.st().title }
+func (m AppModel) headerStyle() lipgloss.Style      { return m.st().header }
+func (m AppModel) tabActiveStyle() lipgloss.Style   { return m.st().tabActive }
+func (m AppModel) tabInactiveStyle() lipgloss.Style { return m.st().tabInactive }
+func (m AppModel) helpStyle() lipgloss.Style        { return m.st().help }
+func (m AppModel) cursorStyle() lipgloss.Style      { return m.st().cursor }
+func (m AppModel) selectedStyle() lipgloss.Style    { return m.st().selected }
+func (m AppModel) infoStyle() lipgloss.Style        { return m.st().info }
+func (m AppModel) successStyle() lipgloss.Style     { return m.st().success }
+func (m AppModel) logStyle() lipgloss.Style         { return m.st().log }
 
 func (m AppModel) getVersionStyle(updateType finder.UpdateType) lipgloss.Style {
-	switch updateType {
-	case finder.Patch:
-		return lipgloss.NewStyle().Foreground(m.colors.ToLipglossColor(m.colors.Patch))
-	case finder.Minor:
-		return lipgloss.NewStyle().Foreground(m.colors.ToLipglossColor(m.colors.Minor))
-	case finder.Major:
-		return lipgloss.NewStyle().Foreground(m.colors.ToLipglossColor(m.colors.Major))
-	case finder.Prerelease:
-		return lipgloss.NewStyle().Foreground(m.colors.ToLipglossColor(m.colors.Prerelease))
-	default:
+	s := m.st()
+	if int(updateType) < 0 || int(updateType) >= len(s.version) {
 		return lipgloss.NewStyle()
 	}
+	return s.version[updateType]
 }

@@ -274,7 +274,7 @@ func TestEmptyUpdateTabDistinguishesFilterFromNoUpdates(t *testing.T) {
 
 func TestElidePathKeepsTail(t *testing.T) {
 	long := "github.com/some/very/long/organization/name/deep/nested/package/path"
-	got := elidePath(long)
+	got := elideTo(long, pathColumnWidth)
 
 	if len([]rune(got)) > pathColumnWidth {
 		t.Errorf("elided path is %d runes, want <= %d: %q", len([]rune(got)), pathColumnWidth, got)
@@ -283,7 +283,7 @@ func TestElidePathKeepsTail(t *testing.T) {
 	if !contains(got, "package/path") {
 		t.Errorf("elided path lost its tail: %q", got)
 	}
-	if short := elidePath("github.com/a/b"); short != "github.com/a/b" {
+	if short := elideTo("github.com/a/b", pathColumnWidth); short != "github.com/a/b" {
 		t.Errorf("short path was modified: %q", short)
 	}
 }

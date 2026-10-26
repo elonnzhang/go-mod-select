@@ -2,11 +2,16 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"go-mod-select/pkg/analyzer"
 	"go-mod-select/pkg/finder"
@@ -15,6 +20,7 @@ import (
 	"go-mod-select/pkg/updater"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Analysis status values shared between the worker and the renderer.
@@ -75,19 +81,17 @@ func inRange(cursor, n int) bool {
 // detailSubject identifies what the currently open popup describes, so a slow
 // result arriving after the user moved on can be discarded.
 func (m AppModel) detailSubject() string {
+	i, ok := m.selectedIndex()
+	if !ok {
+		return ""
+	}
 	switch m.currentTab {
 	case tabRequire:
-		if inRange(m.cursor, len(m.requireModules)) {
-			return m.requireModules[m.cursor].Path
-		}
+		return m.requireModules[i].Path
 	case tabIndirect:
-		if inRange(m.cursor, len(m.indirectModules)) {
-			return m.indirectModules[m.cursor].Path
-		}
+		return m.indirectModules[i].Path
 	case tabReplace:
-		if inRange(m.cursor, len(m.replaceModules)) {
-			return m.replaceModules[m.cursor].Old
-		}
+		return m.replaceModules[i].Old
 	}
 	return ""
 }
@@ -95,28 +99,24 @@ func (m AppModel) detailSubject() string {
 // detailHeader is the part of a detail popup that needs no subprocess, so it
 // can render instantly while the slow part loads.
 func (m AppModel) detailHeader() (title string, ok bool) {
+	i, ok := m.selectedIndex()
+	if !ok {
+		return "", false
+	}
+
 	switch m.currentTab {
 	case tabRequire:
-		if !inRange(m.cursor, len(m.requireModules)) {
-			return "", false
-		}
-		req := m.requireModules[m.cursor]
+		req := m.requireModules[i]
 		return fmt.Sprintf("📦 Require Directive Details\n\nModule Path:  %s\nVersion:      %s\nType:         Direct dependency\n",
 			req.Path, req.Version), true
 
 	case tabIndirect:
-		if !inRange(m.cursor, len(m.indirectModules)) {
-			return "", false
-		}
-		req := m.indirectModules[m.cursor]
+		req := m.indirectModules[i]
 		return fmt.Sprintf("📦 Indirect Require Details\n\nModule Path:  %s\nVersion:      %s\nType:         Indirect dependency\n",
 			req.Path, req.Version), true
 
 	case tabReplace:
-		if !inRange(m.cursor, len(m.replaceModules)) {
-			return "", false
-		}
-		rep := m.replaceModules[m.cursor]
+		rep := m.replaceModules[i]
 		return fmt.Sprintf("🔄 Replace Directive Details\n\nOriginal:     %s\nReplacement:  %s\n\n"+
 			"Replace directives override a dependency with a local or forked copy.\n",
 			rep.Old, rep.New), true
@@ -131,19 +131,21 @@ func (m AppModel) detailHeader() (title string, ok bool) {
 // freeze; running them inline in Update stalled every keystroke and the spinner
 // until they returned.
 func (m AppModel) loadDetailBody() tea.Cmd {
+	i, ok := m.selectedIndex()
+	if !ok {
+		return nil
+	}
+
 	tab := m.currentTab
 	root := m.projectRoot
+	seq := m.detailSeq
 
 	var modPath string
 	switch tab {
 	case tabRequire:
-		if inRange(m.cursor, len(m.requireModules)) {
-			modPath = m.requireModules[m.cursor].Path
-		}
+		modPath = m.requireModules[i].Path
 	case tabIndirect:
-		if inRange(m.cursor, len(m.indirectModules)) {
-			modPath = m.indirectModules[m.cursor].Path
-		}
+		modPath = m.indirectModules[i].Path
 	default:
 		return nil
 	}
@@ -179,21 +181,16 @@ func (m AppModel) loadDetailBody() tea.Cmd {
 				"which your own code does not import directly.\n")
 		}
 
-		return detailLoadedMsg{module: modPath, body: b.String()}
+		return detailLoadedMsg{module: modPath, body: b.String(), seq: seq}
 	}
 }
 
-func (m *AppModel) updateViewport() {
-	if !m.ready {
-		return
-	}
-	content := m.renderModuleList()
-	m.viewport.SetContent(content)
-	// Content shrinking (e.g. a narrower filter) can leave YOffset past the
-	// end, which renders as a blank pane.
-	if m.viewport.YOffset > m.viewport.TotalLineCount()-m.viewport.Height {
-		m.viewport.GotoBottom()
-	}
+// setDetailContent loads the popup text into its viewport, wrapped to the
+// viewport's width. The viewport clips rather than wraps, so an unwrapped long
+// line (a deep file path) would silently lose its tail.
+func (m *AppModel) setDetailContent() {
+	w, _ := m.detailViewportSize()
+	m.detailViewport.SetContent(lipgloss.NewStyle().Width(w).Render(m.detailContent))
 }
 
 // markUpdated flags a module as applied so the list and completion summary can
@@ -205,6 +202,27 @@ func (m *AppModel) markUpdated(path string) {
 			return
 		}
 	}
+}
+
+// updatedPaths is the set of modules applied so far.
+func (m AppModel) updatedPaths() map[string]bool {
+	set := make(map[string]bool)
+	for _, mod := range m.updatedModules() {
+		set[mod.Info.Path] = true
+	}
+	return set
+}
+
+// updatedThisRun returns the modules the latest run applied: those updated now
+// that were not already updated when it started.
+func (m AppModel) updatedThisRun() []*SelectableModule {
+	var out []*SelectableModule
+	for _, mod := range m.updatedModules() {
+		if !m.updatedBefore[mod.Info.Path] {
+			out = append(out, mod)
+		}
+	}
+	return out
 }
 
 // updatedModules returns the modules applied so far, in list order.
@@ -223,23 +241,6 @@ func (m AppModel) maxAnalyzingLogOffset() int {
 	return max(0, len(m.analysisLogs)-m.getAnalyzingLogVisibleLines())
 }
 
-func (m *AppModel) syncViewportToCursor() {
-	if !m.ready {
-		return
-	}
-
-	// One list row per line, so the cursor index is its line number.
-	cursorLine := m.cursor
-	top := m.viewport.YOffset
-	bottom := top + m.viewport.Height - 1
-
-	if cursorLine > bottom {
-		m.viewport.ScrollDown(cursorLine - bottom)
-	} else if cursorLine < top {
-		m.viewport.ScrollUp(top - cursorLine)
-	}
-}
-
 // Fixed chrome heights used to size the scrollable module list. These match
 // the rows emitted by renderSelectionHeader/renderTabs/renderFooter.
 const (
@@ -248,49 +249,132 @@ const (
 	minViewport  = 3
 )
 
-func (m AppModel) getHeaderHeight() int { return headerHeight }
-
-func (m AppModel) getFooterHeight() int { return footerHeight }
-
-// getViewportHeight is clamped so a short terminal still renders a usable
-// list instead of a negative-height viewport.
+// getViewportHeight is the number of list rows on screen, clamped so a short
+// terminal still renders a usable list instead of a negative height.
 func (m AppModel) getViewportHeight() int {
 	return max(minViewport, m.height-headerHeight-footerHeight)
 }
 
-func (m AppModel) getMaxCursor() int {
+// pageSize is how far PgUp/PgDn move: a screenful, keeping one row of overlap
+// so the eye keeps its place.
+func (m AppModel) pageSize() int {
+	return max(1, m.getViewportHeight()-1)
+}
+
+// tabLen is the number of entries in the active tab before filtering.
+func (m AppModel) tabLen() int {
 	switch m.currentTab {
 	case tabUpdate:
-		return len(m.getVisibleUpdateModules()) - 1
+		return len(m.updateModules)
 	case tabRequire:
-		return len(m.requireModules) - 1
+		return len(m.requireModules)
 	case tabIndirect:
-		return len(m.indirectModules) - 1
+		return len(m.indirectModules)
 	case tabReplace:
-		return len(m.replaceModules) - 1
+		return len(m.replaceModules)
 	}
 	return 0
 }
 
-// getVisibleUpdateModules returns indices into updateModules that match the
-// active filter, matching case-insensitively on the module path.
-func (m AppModel) getVisibleUpdateModules() []int {
+// tabText is the text the filter matches for entry i of the active tab.
+func (m AppModel) tabText(i int) string {
+	switch m.currentTab {
+	case tabUpdate:
+		return m.updateModules[i].Info.Path
+	case tabRequire:
+		return m.requireModules[i].Path
+	case tabIndirect:
+		return m.indirectModules[i].Path
+	case tabReplace:
+		return m.replaceModules[i].Old + " " + m.replaceModules[i].New
+	}
+	return ""
+}
+
+// visibleIndices returns indices into the active tab's entries that match the
+// filter (case-insensitively), in list order. The filter applies to every tab.
+func (m AppModel) visibleIndices() []int {
+	n := m.tabLen()
+	indices := make([]int, 0, n)
+
 	if m.filterInput == "" {
-		indices := make([]int, len(m.updateModules))
-		for i := range m.updateModules {
-			indices[i] = i
+		for i := 0; i < n; i++ {
+			indices = append(indices, i)
 		}
 		return indices
 	}
 
-	var visible []int
 	filter := strings.ToLower(m.filterInput)
-	for i, mod := range m.updateModules {
-		if strings.Contains(strings.ToLower(mod.Info.Path), filter) {
-			visible = append(visible, i)
+	for i := 0; i < n; i++ {
+		if strings.Contains(strings.ToLower(m.tabText(i)), filter) {
+			indices = append(indices, i)
 		}
 	}
-	return visible
+	return indices
+}
+
+// visibleCount is len(visibleIndices()) without building the slice when no
+// filter is active, which is every cursor move.
+func (m AppModel) visibleCount() int {
+	if m.filterInput == "" {
+		return m.tabLen()
+	}
+	return len(m.visibleIndices())
+}
+
+// getMaxCursor is the last valid cursor position; -1 when the list is empty.
+func (m AppModel) getMaxCursor() int {
+	return m.visibleCount() - 1
+}
+
+// selectedIndex maps the cursor to an index into the active tab's entries.
+func (m AppModel) selectedIndex() (int, bool) {
+	indices := m.visibleIndices()
+	if !inRange(m.cursor, len(indices)) {
+		return 0, false
+	}
+	return indices[m.cursor], true
+}
+
+// moveCursor puts the cursor at pos, clamped to the list, and scrolls to keep
+// it on screen. The clamp to 0 matters on an empty list, where the last valid
+// position is -1: a cursor of -1 would stick and index out of range.
+func (m *AppModel) moveCursor(pos int) {
+	m.cursor = max(0, min(pos, m.getMaxCursor()))
+	m.scrollToCursor()
+}
+
+// scrollToCursor shifts the visible window the minimum distance that includes
+// the cursor row.
+func (m *AppModel) scrollToCursor() {
+	h := m.getViewportHeight()
+	if m.cursor < m.listTop {
+		m.listTop = m.cursor
+	} else if m.cursor >= m.listTop+h {
+		m.listTop = m.cursor - h + 1
+	}
+	m.listTop = max(0, m.listTop)
+}
+
+// clampList re-establishes the cursor and window invariants after the list or
+// the terminal height changed underneath them.
+func (m *AppModel) clampList() {
+	m.cursor = max(0, min(m.cursor, m.getMaxCursor()))
+	m.listTop = max(0, min(m.listTop, m.visibleCount()-m.getViewportHeight()))
+	m.scrollToCursor()
+}
+
+// resetList returns to the top of the list after the filter changed.
+func (m *AppModel) resetList() {
+	m.cursor = 0
+	m.listTop = 0
+}
+
+// switchTab activates a tab, starting at its top.
+func (m *AppModel) switchTab(tab tabType) {
+	m.currentTab = tab
+	m.resetList()
+	m.fitColumns()
 }
 
 func (m AppModel) countSelected() int {
@@ -303,19 +387,39 @@ func (m AppModel) countSelected() int {
 	return count
 }
 
+// splitRequires separates go.mod's require directives into direct and indirect.
+func splitRequires(requires []parser.Require) (direct, indirect []parser.Require) {
+	for _, req := range requires {
+		if req.Indirect {
+			indirect = append(indirect, req)
+		} else {
+			direct = append(direct, req)
+		}
+	}
+	return direct, indirect
+}
+
+// replaceInfos renders go.mod's replace directives for display.
+func replaceInfos(goMod *parser.GoMod) []ReplaceInfo {
+	var replaces []ReplaceInfo
+	for _, rep := range goMod.Replace {
+		oldModule := rep.OldPath
+		if rep.OldVersion != "" {
+			oldModule += "@" + rep.OldVersion
+		}
+		newModule := rep.NewPath
+		if rep.NewVersion != "" {
+			newModule += "@" + rep.NewVersion
+		}
+		replaces = append(replaces, ReplaceInfo{Old: oldModule, New: newModule})
+	}
+	return replaces
+}
+
 // analyzeModules starts the analysis process and returns a subscription command
 func (m AppModel) analyzeModules() tea.Cmd {
 	return func() tea.Msg {
-		// Separate direct and indirect requires
-		var directRequires []parser.Require
-		var indirectRequires []parser.Require
-		for _, req := range m.goMod.Requires {
-			if req.Indirect {
-				indirectRequires = append(indirectRequires, req)
-			} else {
-				directRequires = append(directRequires, req)
-			}
-		}
+		directRequires, indirectRequires := splitRequires(m.goMod.Requires)
 
 		total := len(directRequires)
 		if total == 0 {
@@ -413,8 +517,11 @@ func startAnalysisWorker(msg startAnalysisMsg, sub chan<- tea.Msg, done <-chan s
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		<-done
-		cancel()
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	f := finder.NewWithContext(ctx, msg.projectRoot)
@@ -441,7 +548,7 @@ func startAnalysisWorker(msg startAnalysisMsg, sub chan<- tea.Msg, done <-chan s
 				return
 			}
 
-			info, err := f.FindCompatibleVersions(r.Path, r.Version, msg.targetGoVersion)
+			info, err := findSafely(f, r.Path, r.Version, msg.targetGoVersion)
 			pkg := AnalyzedPackage{
 				Pkg:    r.Path,
 				Info:   info,
@@ -475,28 +582,26 @@ func startAnalysisWorker(msg startAnalysisMsg, sub chan<- tea.Msg, done <-chan s
 
 	requireModules := extractUpdatable(completedPackages)
 
-	var replaces []ReplaceInfo
-	for _, rep := range msg.goMod.Replace {
-		oldModule := rep.OldPath
-		if rep.OldVersion != "" {
-			oldModule += "@" + rep.OldVersion
-		}
-		newModule := rep.NewPath
-		if rep.NewVersion != "" {
-			newModule += "@" + rep.NewVersion
-		}
-		replaces = append(replaces, ReplaceInfo{
-			Old: oldModule,
-			New: newModule,
-		})
-	}
-
 	send(sub, done, analyzeCompleteMsg{
 		requireModules:    requireModules,
 		indirectModules:   msg.indirectRequires,
-		replaces:          replaces,
+		replaces:          replaceInfos(msg.goMod),
 		completedPackages: completedPackages,
 	})
+}
+
+// findSafely is FindCompatibleVersions with a panic turned into an error.
+// Each lookup runs in its own goroutine, outside the recover that guards the
+// worker's coordinator, so an unrecovered panic here would take the whole
+// process down with the terminal still in raw mode.
+func findSafely(f *finder.Finder, path, current, target string) (info *finder.ModuleInfo, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Log.Error("version lookup panicked", "module", path, "panic", fmt.Sprint(r))
+			info, err = nil, fmt.Errorf("internal error: %v", r)
+		}
+	}()
+	return f.FindCompatibleVersions(path, current, target)
 }
 
 // classify maps an analysis result to the status string the TUI renders.
@@ -537,28 +642,18 @@ func (m AppModel) handleAnalyzeComplete(msg analyzeCompleteMsg) (tea.Model, tea.
 		}
 	}
 
-	// Separate direct and indirect requires from go.mod for read-only display
-	var directRequires []parser.Require
-	var indirectRequires []parser.Require
-	for _, req := range m.goMod.Requires {
-		if req.Indirect {
-			indirectRequires = append(indirectRequires, req)
-		} else {
-			directRequires = append(directRequires, req)
-		}
-	}
-
-	m.requireModules = directRequires
-	m.indirectModules = indirectRequires
+	// Direct and indirect requires come from go.mod for the read-only tabs.
+	m.requireModules, m.indirectModules = splitRequires(m.goMod.Requires)
 	m.replaceModules = msg.replaces
 
-	// Switch to selection screen
+	// The terminal size is already known, so lay the list out right here.
+	// (This used to bounce a synthetic WindowSizeMsg through the event loop,
+	// carrying a size that a real resize could overtake.)
 	m.currentScreen = screenSelection
-	m.ready = false // Will be set to true on next WindowSizeMsg
+	m.resetList()
+	m.fitColumns()
 
-	return m, func() tea.Msg {
-		return tea.WindowSizeMsg{Width: m.width, Height: m.height}
-	}
+	return m, nil
 }
 
 // performUpdate executes the actual update with real-time progress
@@ -591,20 +686,48 @@ func waitForUpdateMsg(sub <-chan tea.Msg) tea.Cmd {
 
 // startUpdateWorker performs the update and sends progress through the channel.
 //
-// Unlike the analysis worker this one does not abort on `done`: it is midway
-// through rewriting go.mod, and stopping between `go get` calls would leave the
-// module in a state neither the user nor the rollback expects. It only uses
-// done to avoid blocking on sends once the UI has gone away.
-func startUpdateWorker(msg startUpdateMsg, sub chan<- tea.Msg, done <-chan struct{}) {
+// Unlike the analysis worker this one does not abort when the UI goes away: it
+// is midway through rewriting go.mod, and stopping between `go get` calls would
+// leave the module in a state neither the user nor the rollback expects. It
+// stops only through ctx, which makes the updater interrupt the go command in
+// flight and roll both files back. done merely turns shutdown into such a
+// cancellation, and stops sends from blocking once the UI has gone away.
+func startUpdateWorker(ctx context.Context, cancel context.CancelFunc, msg startUpdateMsg, sub chan<- tea.Msg, done <-chan struct{}) {
+	defer cancel()
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	var upd *updater.Updater
+	committed := false // the run finished; there is nothing left to undo
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Log.Error("update worker panicked", "panic", fmt.Sprint(r))
-			send(sub, done, updateFailedMsg{err: fmt.Errorf("internal error: %v", r)})
+			logger.Log.Error("update worker panicked", "panic", fmt.Sprint(r), "committed", committed)
+			if committed {
+				// The update itself succeeded and stays on disk; only the
+				// follow-up reads failed. Reporting a failure here would claim a
+				// rollback that never happened.
+				send(sub, done, updateCompleteMsg{goVersionMatched: true})
+				return
+			}
+			err := fmt.Errorf("internal error: %v", r)
+			// The panic may have struck between two go commands, with go.mod
+			// already rewritten; undo that before reporting.
+			if upd != nil && !committed {
+				if rbErr := upd.Rollback(); rbErr != nil {
+					err = fmt.Errorf("%w (%w)", err, rbErr)
+				}
+			}
+			send(sub, done, updateFailedMsg{err: err})
 			send(sub, done, updateCompleteMsg{})
 		}
 	}()
 
-	upd := updater.NewUpdater(msg.goMod)
+	upd = updater.NewUpdater(msg.goMod).WithContext(ctx)
 
 	progressCb := func(current, total int, module, status string) {
 		send(sub, done, updateProgressMsg{
@@ -623,11 +746,26 @@ func startUpdateWorker(msg startUpdateMsg, sub chan<- tea.Msg, done <-chan struc
 		return
 	}
 
+	committed = true
+
 	// `go mod tidy` can raise the go directive above what was requested when a
 	// remaining dependency needs a newer toolchain, so report what is actually
 	// on disk instead of echoing the request.
 	actual, matched, err := upd.VerifyGoVersion(msg.targetGoVersion)
-	send(sub, done, updateCompleteMsg{actualGoVersion: actual, goVersionMatched: matched || err != nil})
+
+	// Tidy may also have added, dropped or re-pinned requirements; hand back the
+	// file as it is now so the read-only tabs do not show startup's version.
+	refreshed, perr := parser.ParseGoMod(msg.goMod.FilePath)
+	if perr != nil {
+		logger.Log.Warn("could not re-read go.mod after update", "error", perr.Error())
+		refreshed = nil
+	}
+
+	send(sub, done, updateCompleteMsg{
+		actualGoVersion:  actual,
+		goVersionMatched: matched || err != nil,
+		refreshed:        refreshed,
+	})
 }
 
 // analyzePackagesParallel analyzes packages in parallel and returns detailed
@@ -649,7 +787,7 @@ func analyzePackagesParallel(requires []parser.Require, targetGoVersion, project
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			info, err := f.FindCompatibleVersions(r.Path, r.Version, targetGoVersion)
+			info, err := findSafely(f, r.Path, r.Version, targetGoVersion)
 			pkg := AnalyzedPackage{
 				Pkg:    r.Path,
 				Info:   info,
@@ -706,6 +844,69 @@ func (m AppModel) getAnalyzingLogVisibleLines() int {
 	return rows
 }
 
+// errorLines splits an error into at most maxLines display rows of at most
+// width runes. go failures embed their entire stderr, which can run to dozens of
+// lines; shown raw it outgrows the terminal and bubbletea drops the top rows,
+// heading included. The full text stays in the log file.
+func errorLines(err error, maxLines, width int) []string {
+	var rows []string
+	for _, line := range strings.Split(err.Error(), "\n") {
+		line = strings.TrimRight(line, " \t\r")
+		if line == "" {
+			continue
+		}
+		if r := []rune(line); len(r) > width {
+			line = string(r[:max(width-1, 0)]) + "…"
+		}
+		rows = append(rows, line)
+	}
+	if len(rows) > maxLines {
+		hidden := len(rows) - maxLines
+		rows = append(rows[:maxLines], fmt.Sprintf("… %d more line(s); full output in ~/.go-mod-select/app.log", hidden))
+	}
+	return rows
+}
+
+// reasonText is the failure reason for the summary box, clipped to fit it and
+// with continuation rows aligned under the first.
+func (m AppModel) reasonText() string {
+	return strings.Join(errorLines(m.updateError, 8, max(m.width-16, 20)), "\n        ")
+}
+
+// wasCancelled reports whether an update run ended because the user cancelled.
+func wasCancelled(err error) bool { return errors.Is(err, updater.ErrCancelled) }
+
+// rolledBack reports whether a failed run left go.mod and go.sum restored.
+func rolledBack(err error) bool { return !errors.Is(err, updater.ErrRollbackFailed) }
+
+// shutdownGrace bounds how long TUI waits for workers to clean up after the
+// program quits: killing `go list` children, removing the scratch module, or
+// rolling back an interrupted update.
+const shutdownGrace = 10 * time.Second
+
+// waitWorkers waits for tracked workers, up to grace.
+func waitWorkers(wg *sync.WaitGroup, grace time.Duration) {
+	if wg == nil {
+		return
+	}
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+	// The terminal is already restored by now; say why exit is not instant.
+	notice := time.AfterFunc(300*time.Millisecond, func() {
+		fmt.Fprintln(os.Stderr, "go-mod-select: finishing cleanup (restoring go.mod/go.sum, removing temp files)…")
+	})
+	defer notice.Stop()
+
+	select {
+	case <-finished:
+	case <-time.After(grace):
+		logger.Log.Warn("workers still running at exit", "grace", grace.String())
+	}
+}
+
 // TUI runs the interactive application. It applies the updates itself (via the
 // updating screen), so it reports only whether the session ran cleanly.
 //
@@ -715,13 +916,40 @@ func (m AppModel) getAnalyzingLogVisibleLines() int {
 func TUI(targetGoVersion string, goMod *parser.GoMod, projectRoot string) error {
 	m := InitialAppModel(targetGoVersion, goMod, projectRoot)
 
-	// Signal shutdown once Run returns, so any worker still in flight stops
-	// instead of blocking forever on a channel the event loop no longer reads.
-	// Without this, quitting mid-analysis leaked the finder's scratch directory
-	// and orphaned its `go list` children.
-	defer close(m.quit)
-
 	p := tea.NewProgram(m, tea.WithAltScreen())
+
+	// bubbletea traps SIGINT and SIGTERM but not SIGHUP, so closing the terminal
+	// (or dropping an ssh session) mid-update killed the process with go.mod
+	// half-written. Treat it as a quit: that cancels and rolls back like Ctrl+C.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		select {
+		case <-hup:
+			p.Quit()
+		case <-m.quit:
+		}
+	}()
+
+	// Signal shutdown once Run returns so any worker still in flight stops
+	// instead of blocking forever on a channel the event loop no longer reads,
+	// then wait for it to finish cleaning up. Returning at once let the process
+	// exit before a worker could remove the finder's scratch directory or the
+	// updater could roll back, leaking the former and abandoning the latter.
+	defer func() {
+		// Past this point the terminal is in cooked mode again, so a further
+		// Ctrl+C is a real SIGINT that would kill us mid-rollback. The shield is
+		// installed before the workers are released, and before the SIGHUP
+		// handler goes away, so no signal arrives to a default action.
+		shield := make(chan os.Signal, 8)
+		signal.Notify(shield, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer signal.Stop(shield)
+		signal.Stop(hup)
+
+		close(m.quit)
+		waitWorkers(m.workers, shutdownGrace)
+	}()
+
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("error running TUI: %w", err)
 	}
