@@ -15,19 +15,47 @@ import (
 )
 
 //go:embed banner.txt
-var banner string
+var bannerArt string
+
+// banner is bannerArt as a block: no trailing blank lines and every line padded
+// to the same width. Centring is done line by line, so lines of different
+// lengths would each land at a different column and skew the art.
+var banner = blockOf(bannerArt)
+
+// blockOf trims blank lines from the ends of art and right-pads every line to
+// the width of the longest.
+func blockOf(art string) string {
+	lines := strings.Split(strings.Trim(art, "\n"), "\n")
+	width := 0
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " \t\r")
+		width = max(width, lipgloss.Width(lines[i]))
+	}
+	for i, l := range lines {
+		lines[i] = l + strings.Repeat(" ", width-lipgloss.Width(l))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// fallbackTitle stands in for the banner on a terminal too narrow to hold it.
+const fallbackTitle = "go-mod-select"
+
+// renderBanner draws the banner centred in the theme's title colour. It used to
+// be 92 columns wide, so on an 80-column terminal every row wrapped and the art
+// came out as noise.
+func (m AppModel) renderBanner() string {
+	art := banner
+	if lipgloss.Width(art) > m.width-2 {
+		art = fallbackTitle
+	}
+	return m.st().title.UnsetPadding().Width(m.width).Align(lipgloss.Center).Render(art)
+}
 
 func (m AppModel) renderWelcome() string {
 	var b strings.Builder
 
-	// Banner
-	bannerStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("205")).
-		Width(m.width).
-		Align(lipgloss.Center)
-
-	b.WriteString(bannerStyle.Render(banner))
-	b.WriteString("\n")
+	b.WriteString(m.renderBanner())
+	b.WriteString("\n\n")
 
 	// Current info box
 	infoBox := lipgloss.NewStyle().
@@ -85,12 +113,7 @@ func (m AppModel) renderAnalyzing() string {
 	// Top section content
 	var topSection strings.Builder
 
-	title := m.titleStyle().
-		Width(m.width).
-		Align(lipgloss.Center).
-		Render(banner)
-
-	topSection.WriteString(title)
+	topSection.WriteString(m.renderBanner())
 	topSection.WriteString("\n\n")
 
 	// Main status with spinner

@@ -18,7 +18,7 @@ go-mod-select/
 │   │   ├── app_helpers.go   # worker 编排、详情加载、派生状态、退出时的收尾
 │   │   ├── app_styles.go    # 按主题一次性构建的样式
 │   │   ├── app_keys.go      # 按键绑定表
-│   │   └── banner.txt       # 嵌入的 ASCII banner
+│   │   └── banner.txt       # 嵌入的 banner（3 行、39 列的制表符字形）
 │   ├── scan/                # 并发查询每个直接依赖的最新兼容版本（TUI 与 CLI 共用）
 │   ├── updater/             # go get / go mod tidy / 回滚 / 取消 / 版本校验
 │   ├── controller/          # 模式分派（dry-run / auto / TUI）
