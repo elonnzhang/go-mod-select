@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,5 +123,65 @@ func TestMaxUpdateIsValidatedBeforeAnythingRuns(t *testing.T) {
 
 	if err == nil || !strings.Contains(err.Error(), "--max-update") {
 		t.Errorf("an unknown level should be rejected by name, got %v", err)
+	}
+}
+
+func TestResolveTargetVersion(t *testing.T) {
+	cases := []struct {
+		name         string
+		goFlag, old  string
+		args         []string
+		want         string
+		wantErrSnipt string
+	}{
+		{name: "positional", args: []string{"1.25"}, want: "1.25"},
+		{name: "--go", goFlag: "1.24", want: "1.24"},
+		{name: "legacy -v still works", old: "1.23", want: "1.23"},
+		{name: "go prefix and spaces are tolerated", args: []string{" go1.25 "}, want: "1.25"},
+		{name: "the same version twice is fine", args: []string{"1.25"}, goFlag: "1.25", want: "1.25"},
+		{name: "none given", wantErrSnipt: "required"},
+		{name: "disagreement is an error", args: []string{"1.25"}, goFlag: "1.24", wantErrSnipt: "conflicting"},
+	}
+	for _, c := range cases {
+		got, err := resolveTargetVersion(c.goFlag, c.old, c.args)
+		if c.wantErrSnipt != "" {
+			if err == nil || !strings.Contains(err.Error(), c.wantErrSnipt) {
+				t.Errorf("%s: err = %v, want one containing %q", c.name, err, c.wantErrSnipt)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("%s: got %q, %v; want %q", c.name, got, err, c.want)
+		}
+	}
+}
+
+// --version used to take the target Go version. It prints the tool's version now.
+func TestVersionFlagPrintsTheToolVersion(t *testing.T) {
+	var out bytes.Buffer
+	rootCmd.SetOut(&out)
+	rootCmd.SetArgs([]string{"--version"})
+	t.Cleanup(func() { rootCmd.SetOut(nil); rootCmd.SetArgs(nil) })
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); !strings.HasPrefix(got, "go-mod-select ") || len(strings.TrimSpace(got)) <= len("go-mod-select") {
+		t.Errorf("--version printed %q", got)
+	}
+}
+
+func TestToolVersionPrefersTheLinkedInValue(t *testing.T) {
+	old := Version
+	t.Cleanup(func() { Version = old })
+
+	Version = "v9.9.9"
+	if got := toolVersion(); got != "v9.9.9" {
+		t.Errorf("toolVersion() = %q, want the -ldflags value", got)
+	}
+
+	Version = ""
+	if got := toolVersion(); got == "" {
+		t.Error("toolVersion() must never be empty")
 	}
 }

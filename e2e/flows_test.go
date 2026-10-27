@@ -450,3 +450,31 @@ func TestMaxUpdateHoldsBackLargerJumps(t *testing.T) {
 		t.Errorf("a bad level should be rejected, got err=%v\n%s", err, out)
 	}
 }
+
+// --version used to take the target Go version. It prints the tool's version now;
+// the old -v spelling keeps working, with a notice.
+func TestVersionFlagAndTheOldSpellings(t *testing.T) {
+	p := newFakeProxy(t)
+	twoReleases(p, "example.com/dep1")
+	sb := newSandbox(t, p, "example.com/dep1")
+
+	out, err := exec.Command(bin, "--version").CombinedOutput()
+	if err != nil || !strings.HasPrefix(string(out), "go-mod-select ") {
+		t.Errorf("--version printed %q (err %v)", out, err)
+	}
+
+	for _, args := range [][]string{
+		{"--go", "1.21", "--dir", sb.dir, "--dry-run"},
+		{"-v", "1.21", "--dir", sb.dir, "--dry-run"},
+	} {
+		cmd := exec.Command(bin, args...)
+		cmd.Env, cmd.Dir = sb.env, sb.dir
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "example.com/dep1: v1.0.0 → v1.1.0") {
+			t.Errorf("%v failed: %v\n%s", args, err, out)
+		}
+		if args[0] == "-v" && !strings.Contains(string(out), "deprecated") {
+			t.Errorf("-v should say it is deprecated:\n%s", out)
+		}
+	}
+}

@@ -14,7 +14,8 @@ import (
 )
 
 var (
-	version        string
+	goVersion      string
+	legacyVersion  string
 	dryRun         bool
 	verbose        bool
 	modFile        string
@@ -56,7 +57,22 @@ Usage examples:
 }
 
 func init() {
-	rootCmd.Flags().StringVarP(&version, "version", "v", "", "Target Go version (e.g., 1.23, 1.24.1)")
+	rootCmd.Flags().StringVar(&goVersion, "go", "", "Target Go version (e.g., 1.23, 1.24.1); same as the positional argument")
+
+	// -v used to take the target version, and --version with it. --version now
+	// prints this tool's version, as everywhere else; -v keeps working, loudly,
+	// so scripts written for the old spelling are not broken without a word.
+	rootCmd.Flags().StringVarP(&legacyVersion, "legacy-version", "v", "", "")
+	for _, err := range []error{
+		rootCmd.Flags().MarkHidden("legacy-version"),
+		rootCmd.Flags().MarkShorthandDeprecated("legacy-version", "use --go or the positional argument; --version now prints the tool's version"),
+	} {
+		if err != nil {
+			panic(err) // a typo in a flag name above: caught the first time the binary runs
+		}
+	}
+	rootCmd.Version = toolVersion()
+	rootCmd.SetVersionTemplate("go-mod-select {{.Version}}\n")
 	rootCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show available updates without applying them")
 	rootCmd.Flags().BoolVar(&verbose, "verbose", false, "Enable verbose output")
 	rootCmd.Flags().StringVar(&modFile, "gomod", "", "Path to go.mod file")
@@ -83,6 +99,32 @@ func Execute() {
 	}
 }
 
+// resolveTargetVersion picks the target Go version from the positional argument,
+// --go, or the legacy -v, and insists they agree if more than one is given.
+func resolveTargetVersion(goFlag, legacyFlag string, args []string) (string, error) {
+	clean := func(v string) string { return strings.TrimPrefix(strings.TrimSpace(v), "go") }
+
+	var given []string
+	if len(args) > 0 {
+		given = append(given, clean(args[0]))
+	}
+	for _, v := range []string{goFlag, legacyFlag} {
+		if v != "" {
+			given = append(given, clean(v))
+		}
+	}
+
+	if len(given) == 0 {
+		return "", fmt.Errorf("target Go version is required\nUsage: go-mod-select <version> (e.g. go-mod-select 1.25)")
+	}
+	for _, v := range given[1:] {
+		if v != given[0] {
+			return "", fmt.Errorf("conflicting target Go versions %q and %q: give it once", given[0], v)
+		}
+	}
+	return given[0], nil
+}
+
 func run(cmd *cobra.Command, args []string) error {
 	// Logging is best-effort: a read-only home directory should not stop the
 	// tool from doing its job.
@@ -91,17 +133,10 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	logger.Log.Info("go-mod-select started")
 
-	// Parse version from positional argument or flag
-	targetVersion := version
-	if len(args) > 0 {
-		targetVersion = args[0]
+	targetVersion, err := resolveTargetVersion(goVersion, legacyVersion, args)
+	if err != nil {
+		return err
 	}
-
-	if targetVersion == "" {
-		return fmt.Errorf("target Go version is required\nUsage: go-mod-select <version> (e.g. go-mod-select 1.25)")
-	}
-
-	targetVersion = strings.TrimPrefix(strings.TrimSpace(targetVersion), "go")
 
 	// Validate against the same parser used for compatibility comparisons, so
 	// what the CLI accepts and what the finder can compare cannot drift apart.
