@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"go-mod-select/pkg/controller"
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/logger"
+	"github.com/elonnzhang/go-mod-select/pkg/controller"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/logger"
 
 	"github.com/spf13/cobra"
 )

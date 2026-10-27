@@ -7,7 +7,7 @@ import (
 
 // Version is the release version. Release builds set it at link time:
 //
-//	go build -ldflags "-X go-mod-select/cmd.Version=v1.2.3"
+//	go build -ldflags "-X github.com/elonnzhang/go-mod-select/cmd.Version=v1.2.3"
 //
 // When empty, toolVersion falls back to what the Go toolchain recorded.
 var Version string

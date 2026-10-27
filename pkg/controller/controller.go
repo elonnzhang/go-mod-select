@@ -9,11 +9,11 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/parser"
-	"go-mod-select/pkg/scan"
-	"go-mod-select/pkg/ui"
-	"go-mod-select/pkg/updater"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/scan"
+	"github.com/elonnzhang/go-mod-select/pkg/ui"
+	"github.com/elonnzhang/go-mod-select/pkg/updater"
 )
 
 // Config holds the configuration for the controller

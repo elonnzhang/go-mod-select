@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
 )
 
 func requires(n int) []parser.Require {

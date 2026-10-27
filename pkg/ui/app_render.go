@@ -7,9 +7,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/parser"
-	"go-mod-select/pkg/updater"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/updater"
 
 	"github.com/charmbracelet/lipgloss"
 )

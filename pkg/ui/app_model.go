@@ -6,12 +6,12 @@ import (
 	"strings"
 	"sync"
 
-	"go-mod-select/pkg/config"
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/logger"
-	"go-mod-select/pkg/parser"
-	"go-mod-select/pkg/scan"
-	"go-mod-select/pkg/updater"
+	"github.com/elonnzhang/go-mod-select/pkg/config"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/logger"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/scan"
+	"github.com/elonnzhang/go-mod-select/pkg/updater"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/progress"

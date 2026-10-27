@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"go-mod-select/pkg/config"
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/config"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
 
 	tea "github.com/charmbracelet/bubbletea"
 )

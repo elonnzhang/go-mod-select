@@ -14,9 +14,9 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/logger"
-	"go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/logger"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
 )
 
 // Concurrency bounds how many lookups, and so how many `go list` subprocesses,

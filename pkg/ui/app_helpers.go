@@ -11,12 +11,12 @@ import (
 	"syscall"
 	"time"
 
-	"go-mod-select/pkg/analyzer"
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/logger"
-	"go-mod-select/pkg/parser"
-	"go-mod-select/pkg/scan"
-	"go-mod-select/pkg/updater"
+	"github.com/elonnzhang/go-mod-select/pkg/analyzer"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/logger"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/scan"
+	"github.com/elonnzhang/go-mod-select/pkg/updater"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"

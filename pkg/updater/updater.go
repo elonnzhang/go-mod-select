@@ -11,9 +11,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/logger"
-	"go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/logger"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
 )
 
 // ProgressCallback is called during update to report progress

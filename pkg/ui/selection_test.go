@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"

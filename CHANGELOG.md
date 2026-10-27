@@ -111,6 +111,7 @@
 
 ### 🔧 行为变更
 
+- **模块路径从 `go-mod-select` 改为 `github.com/elonnzhang/go-mod-select`**。此前 README 写着 `go install github.com/elonnzhang/go-mod-select@latest`，但 `go.mod` 里的模块路径不含仓库地址，这条命令实际会失败。内部包的 import 路径随之改变，对只使用命令行的用户没有影响；用 `-ldflags` 注入版本时变量路径是 `-X github.com/elonnzhang/go-mod-select/cmd.Version=…`
 - **预发布版本默认不再被提议**。此前所有已发布的 tag 都是候选，`--auto` 可能直接升到某个 `-rc1`。现在只在加了 `--pre`、当前锁定的就是预发布 tag、或模块没有任何正式版时才考虑；被排除的版本不再产生查询
 - **`--version` 现在打印工具版本**，不再表示目标 Go 版本（`--version 1.25` 会打印版本号而不是分析）。目标版本用位置参数或新的 `--go`；`-v 1.25` 仍可用但提示已弃用。位置参数与 `--go` / `-v` 同时给出且不一致时报错，此前位置参数会悄悄覆盖另一个
 - **`--auto` 默认跳过降级**。当前锁定版本要求比目标 Go 更新的工具链时，唯一"兼容"的版本可能更旧。这在交互模式下正常展示由你决定，但无人值守时悄悄把依赖往回退不是"应用全部更新"的语义。需要时加 `--allow-downgrade`

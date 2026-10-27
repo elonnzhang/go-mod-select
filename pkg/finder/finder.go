@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"go-mod-select/pkg/logger"
+	"github.com/elonnzhang/go-mod-select/pkg/logger"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"

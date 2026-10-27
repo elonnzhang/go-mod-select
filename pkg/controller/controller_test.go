@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"go-mod-select/pkg/updater"
+	"github.com/elonnzhang/go-mod-select/pkg/updater"
 )
 
 func TestUpdateFailureNeverClaimsAFailedRollbackSucceeded(t *testing.T) {

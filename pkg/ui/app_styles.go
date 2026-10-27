@@ -1,8 +1,8 @@
 package ui
 
 import (
-	"go-mod-select/pkg/config"
-	"go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/config"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
 
 	"github.com/charmbracelet/lipgloss"
 )

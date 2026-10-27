@@ -1,4 +1,4 @@
-module go-mod-select
+module github.com/elonnzhang/go-mod-select
 
 go 1.25
 

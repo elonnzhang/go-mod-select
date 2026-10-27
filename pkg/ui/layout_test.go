@@ -4,8 +4,8 @@ import (
 	"strconv"
 	"testing"
 
-	"go-mod-select/pkg/config"
-	"go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/config"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
 
 	"github.com/charmbracelet/lipgloss"
 )

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"go-mod-select/pkg/finder"
-	"go-mod-select/pkg/parser"
+	"github.com/elonnzhang/go-mod-select/pkg/finder"
+	"github.com/elonnzhang/go-mod-select/pkg/parser"
 )
 
 const sampleGoMod = `module example.com/rollback
