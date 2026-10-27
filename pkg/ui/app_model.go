@@ -96,6 +96,7 @@ type AppModel struct {
 	tidySucceeded      bool            // go mod tidy reported success in this update run
 	tidyRunning        bool            // go mod tidy is in flight (not a per-module step)
 	verify             bool            // check that the project still builds after the update, and roll back if not
+	policy             finder.Policy   // which versions may be proposed at all
 	verifyRunning      bool            // that build check is in flight
 	updateFailed       bool            // at least one step of the update run failed
 	updateError        error           // why the update run failed, if it did
@@ -192,6 +193,9 @@ type startUpdateMsg struct {
 type Options struct {
 	// Verify starts with the post-update build check on; `v` toggles it.
 	Verify bool
+
+	// Policy narrows which versions may be proposed (--pre, --max-update).
+	Policy finder.Policy
 }
 
 // InitialAppModel creates a new AppModel with default values
@@ -222,6 +226,7 @@ func InitialAppModel(targetGoVersion string, goMod *parser.GoMod, projectRoot st
 		goMod:           goMod,
 		projectRoot:     projectRoot,
 		verify:          opts.Verify,
+		policy:          opts.Policy,
 		colors:          colors,
 		styles:          newStyleSet(colors),
 		spinner:         s,
@@ -675,6 +680,11 @@ func (m AppModel) handleSelectionInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.toggleAllVisible()
 		}
 
+	case key.Matches(msg, keys.Safe):
+		if canSelect {
+			m.toggleSafeVisible()
+		}
+
 	case key.Matches(msg, keys.Verify):
 		if canSelect {
 			m.verify = !m.verify
@@ -787,6 +797,43 @@ func (m *AppModel) toggleAllVisible() {
 // arrow and page keys keep working while typing — j/k are literal characters
 // here, but the arrows are not — so a match can be reached without leaving the
 // filter first.
+// isSafe reports whether an update is the low-risk kind: a patch or minor bump
+// of a stable release. Majors, prereleases and downgrades are left for the user
+// to look at.
+func isSafe(info *finder.ModuleInfo) bool {
+	return !info.Downgrade && (info.UpdateType == finder.Patch || info.UpdateType == finder.Minor)
+}
+
+// toggleSafeVisible selects every filtered, not-yet-updated patch or minor
+// update — or clears them if any is already selected, like toggleAllVisible but
+// leaving the risky ones alone.
+func (m *AppModel) toggleSafeVisible() {
+	var safe []*SelectableModule
+	for _, idx := range m.visibleIndices() {
+		if mod := m.updateModules[idx]; !mod.Updated && isSafe(mod.Info) {
+			safe = append(safe, mod)
+		}
+	}
+
+	anySelected := false
+	for _, mod := range safe {
+		anySelected = anySelected || mod.Selected
+	}
+
+	for _, mod := range safe {
+		mod.Selected = !anySelected
+	}
+
+	switch {
+	case len(safe) == 0:
+		m.addOperationLog("No patch/minor updates in view")
+	case anySelected:
+		m.addOperationLog(fmt.Sprintf("Deselected %d patch/minor update(s)", len(safe)))
+	default:
+		m.addOperationLog(fmt.Sprintf("Selected %d patch/minor update(s); majors, prereleases and downgrades left alone", len(safe)))
+	}
+}
+
 func (m AppModel) handleFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":

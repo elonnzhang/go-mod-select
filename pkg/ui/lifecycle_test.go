@@ -390,3 +390,73 @@ func TestBuildCheckProgressIsShownAndAFailureFailsTheRun(t *testing.T) {
 		t.Errorf("the summary should name the build check:\n%s", view)
 	}
 }
+
+func TestSafeKeySelectsOnlyPatchAndMinorUpdates(t *testing.T) {
+	m := sized(semverModel(5), 120, 40)
+	types := []finder.UpdateType{finder.Patch, finder.Minor, finder.Major, finder.Prerelease, finder.Minor}
+	for i, mod := range m.updateModules {
+		mod.Info.UpdateType = types[i]
+	}
+	m.updateModules[4].Info.Downgrade = true // a minor-distance move backwards: not "safe"
+
+	m = press(m, keyRunes("s"))
+
+	var selected []int
+	for i, mod := range m.updateModules {
+		if mod.Selected {
+			selected = append(selected, i)
+		}
+	}
+	if len(selected) != 2 || selected[0] != 0 || selected[1] != 1 {
+		t.Errorf("selected %v, want only the patch and the minor update [0 1]", selected)
+	}
+
+	// Pressing it again clears just those, and leaves what the user picked by hand.
+	m.updateModules[2].Selected = true
+	m = press(m, keyRunes("s"))
+	if m.updateModules[0].Selected || m.updateModules[1].Selected || !m.updateModules[2].Selected {
+		t.Error("the second press should clear the safe ones and leave the hand-picked major alone")
+	}
+}
+
+func TestSafeKeyRespectsTheFilter(t *testing.T) {
+	m := sized(semverModel(4), 120, 40)
+	for _, mod := range m.updateModules {
+		mod.Info.UpdateType = finder.Patch
+	}
+	m = press(m, keyRunes("/"))
+	m = typeText(m, "some-module-2")
+	m = press(m, keyType(tea.KeyEnter))
+
+	m = press(m, keyRunes("s"))
+
+	if m.countSelected() != 1 || !m.updateModules[2].Selected {
+		t.Errorf("only the filtered module should be selected, got %d selected", m.countSelected())
+	}
+}
+
+func TestWelcomeScreenStatesTheUpdatePolicy(t *testing.T) {
+	m := semverModel(1)
+	m.goMod = &parser.GoMod{Module: "example.com/x", GoVersion: "1.21"}
+
+	info := m.renderGoModInfo()
+	if !strings.Contains(info, "excluded") || !strings.Contains(info, "none") {
+		t.Errorf("default policy should read: prereleases excluded, no limit:\n%s", info)
+	}
+
+	m.policy = finder.Policy{AllowPrerelease: true, MaxUpdate: finder.LimitMinor}
+	info = m.renderGoModInfo()
+	if !strings.Contains(info, "included") || !strings.Contains(info, "minor") {
+		t.Errorf("policy not shown:\n%s", info)
+	}
+}
+
+func TestRowsSayWhatMaxUpdateHeldBack(t *testing.T) {
+	m := sized(semverModel(1), 140, 40)
+	m.updateModules[0].Info.HeldBack = 3
+	m = sized(m, 140, 40)
+
+	if row := m.renderUpdateLine(m.updateModules[0], false); !strings.Contains(row, "3 held back by --max-update") {
+		t.Errorf("row should explain the missing newer versions: %q", row)
+	}
+}

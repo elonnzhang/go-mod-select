@@ -63,6 +63,17 @@ func (m AppModel) renderGoModInfo() string {
 	b.WriteString(fmt.Sprintf("Direct deps:      %d\n", parser.CountDirectDeps(m.goMod.Requires)))
 	b.WriteString(fmt.Sprintf("Indirect deps:    %d\n", parser.CountIndirectDeps(m.goMod.Requires)))
 
+	pre := "excluded (--pre to include)"
+	if m.policy.AllowPrerelease {
+		pre = "included"
+	}
+	b.WriteString(fmt.Sprintf("Prereleases:      %s\n", pre))
+	limit := "none"
+	if m.policy.MaxUpdate != finder.LimitMajor {
+		limit = m.policy.MaxUpdate.String() + " (--max-update)"
+	}
+	b.WriteString(fmt.Sprintf("Update limit:     %s\n", limit))
+
 	return b.String()
 }
 
@@ -151,7 +162,7 @@ func (m AppModel) selectionHint() string {
 			sel += " | build check on"
 		}
 		variants = []string{
-			"↑↓ move | Space toggle | a all | v build check | Tab switch | / filter | Enter update | " + sel,
+			"↑↓ move | Space toggle | a all | s safe | v build check | Tab switch | / filter | Enter update | " + sel,
 			"↑↓ move | Space toggle | a all | Tab switch | / filter | Enter update | " + sel,
 			"↑↓ move | Space toggle | a all | / filter | Enter update | " + sel,
 			"Space toggle | a all | / filter | Enter update | " + sel,
@@ -669,10 +680,25 @@ func measureUpdate(info *finder.ModuleInfo) updateWidths {
 		both:    utf8.RuneCountInString(info.CurrentVersion) + utf8.RuneCountInString(" → ") + latest,
 		newOnly: utf8.RuneCountInString("→ ") + latest,
 	}
-	if info.BlockedNewer > 0 {
-		w.note = utf8.RuneCountInString(fmt.Sprintf("  (%d newer need a later Go)", info.BlockedNewer))
-	}
+	w.note = utf8.RuneCountInString(blockedNote(info)) + utf8.RuneCountInString(heldBackNote(info))
 	return w
+}
+
+// blockedNote answers "why not the latest release?" for versions the target Go
+// cannot build.
+func blockedNote(info *finder.ModuleInfo) string {
+	if info.BlockedNewer == 0 {
+		return ""
+	}
+	return fmt.Sprintf("  (%d newer need a later Go)", info.BlockedNewer)
+}
+
+// heldBackNote answers it for versions kept back by --max-update.
+func heldBackNote(info *finder.ModuleInfo) string {
+	if info.HeldBack == 0 {
+		return ""
+	}
+	return fmt.Sprintf("  (%d held back by --max-update)", info.HeldBack)
 }
 
 // elideTo shortens path to width columns by dropping its head, rune-aware.
@@ -717,8 +743,8 @@ func (m AppModel) renderUpdateLine(mod *SelectableModule, isCursor bool) string 
 
 		// Answer "why not the latest release?" on the row itself, instead of
 		// leaving the count only in the log file.
-		if n := mod.Info.BlockedNewer; n > 0 && !m.hideNote {
-			versions += m.helpStyle().Render(fmt.Sprintf("  (%d newer need a later Go)", n))
+		if !m.hideNote {
+			versions += m.helpStyle().Render(blockedNote(mod.Info) + heldBackNote(mod.Info))
 		}
 	}
 

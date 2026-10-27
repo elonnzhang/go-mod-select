@@ -22,6 +22,8 @@ var (
 	autoSelect     bool
 	allowDowngrade bool
 	verify         bool
+	pre            bool
+	maxUpdate      string
 )
 
 var rootCmd = &cobra.Command{
@@ -44,6 +46,8 @@ Usage examples:
   go-mod-select 1.25 --dry-run                # Print the plan, change nothing
   go-mod-select 1.25 --auto                   # Apply everything without prompting
   go-mod-select 1.25 --auto --verify          # ...and roll back if the project stops building
+  go-mod-select 1.25 --max-update minor       # Never cross a major version
+  go-mod-select 1.25 --pre                    # Consider prerelease tags too
   go-mod-select 1.25 --verbose                # Pass through go get output`,
 	Args:          cobra.MaximumNArgs(1),
 	RunE:          run,
@@ -62,6 +66,10 @@ func init() {
 		"In --auto mode, also apply versions older than the current one when the current version needs a newer Go")
 	rootCmd.Flags().BoolVar(&verify, "verify", false,
 		"After updating, run go build ./... and roll everything back if the project no longer builds (skipped if it did not build before)")
+	rootCmd.Flags().BoolVar(&pre, "pre", false,
+		"Also propose prerelease tags (v1.2.0-rc1); by default they are skipped unless the module is already on one")
+	rootCmd.Flags().StringVar(&maxUpdate, "max-update", "major",
+		"Largest jump to propose from the current version: patch, minor or major")
 	rootCmd.MarkFlagsMutuallyExclusive("gomod", "dir")
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "verify")
 	rootCmd.MarkFlagsMutuallyExclusive("dry-run", "auto")
@@ -102,6 +110,11 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid Go version %q (expected e.g. 1.24 or 1.24.1)", targetVersion)
 	}
 
+	limit, err := finder.ParseLimit(maxUpdate)
+	if err != nil {
+		return err
+	}
+
 	goModPath, err := resolveGoModPath(modFile, workDir)
 	if err != nil {
 		logger.Log.Error("failed to resolve go.mod path", "error", err)
@@ -129,6 +142,7 @@ func run(cmd *cobra.Command, args []string) error {
 		AutoSelect:      autoSelect,
 		AllowDowngrade:  allowDowngrade,
 		Verify:          verify,
+		Policy:          finder.Policy{AllowPrerelease: pre, MaxUpdate: limit},
 	}
 
 	logger.Log.Info("starting controller",

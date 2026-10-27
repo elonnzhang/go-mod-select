@@ -26,6 +26,8 @@ type Config struct {
 	// AllowDowngrade lets auto mode apply a version older than the current one
 	// when the current version requires a newer Go than the target.
 	AllowDowngrade bool
+	// Policy narrows which versions may be proposed (--pre, --max-update).
+	Policy finder.Policy
 	// Verify checks that the project still builds after an update and rolls the
 	// update back if it does not.
 	Verify bool
@@ -58,18 +60,25 @@ func Run(cfg *Config) error {
 	// The TUI performs the update itself on its updating screen. It used to
 	// also hand the selection back for the caller to apply, which ran every
 	// `go get` a second time.
-	return ui.TUI(cfg.TargetGoVersion, goMod, projectRoot, ui.Options{Verify: cfg.Verify})
+	return ui.TUI(cfg.TargetGoVersion, goMod, projectRoot, ui.Options{Verify: cfg.Verify, Policy: cfg.Policy})
 }
 
 // errInterrupted ends a command-line run the user cancelled.
 var errInterrupted = errors.New("interrupted")
 
+// plan is the outcome of analysing a module's direct requirements.
+type plan struct {
+	updates []*finder.ModuleInfo // a different compatible version is available
+	failed  []scan.Result        // the lookup itself failed
+	held    []*finder.ModuleInfo // already at the newest version the policy allows, but newer ones exist beyond --max-update
+}
+
 // analyze looks up the newest compatible version of every direct requirement.
-// It returns the modules with a different version available, plus the lookups
-// that failed: an error is not "already up to date", and a plan that silently
-// omitted those modules would say it was.
-func analyze(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRoot string) ([]*finder.ModuleInfo, []scan.Result, error) {
+// Failed lookups are kept apart: an error is not "already up to date", and a
+// plan that silently omitted those modules would say it was.
+func analyze(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRoot string) (plan, error) {
 	f := finder.NewWithContext(ctx, projectRoot)
+	f.Policy = cfg.Policy
 	defer f.Close()
 
 	direct, _ := parser.SplitRequires(goMod.Requires)
@@ -78,16 +87,19 @@ func analyze(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRoot 
 	}, direct, nil)
 
 	if ctx.Err() != nil {
-		return nil, nil, errInterrupted
+		return plan{}, errInterrupted
 	}
 
-	var failed []scan.Result
+	p := plan{updates: scan.Updatable(results)}
 	for _, r := range results {
-		if r.Err != nil {
-			failed = append(failed, r)
+		switch {
+		case r.Err != nil:
+			p.failed = append(p.failed, r)
+		case r.Info != nil && r.Info.HeldBack > 0 && r.Info.LatestCompatible == r.Info.CurrentVersion:
+			p.held = append(p.held, r.Info)
 		}
 	}
-	return scan.Updatable(results), failed, nil
+	return p, nil
 }
 
 // printFailures lists lookups that could not be completed.
@@ -118,25 +130,28 @@ func updateFailure(err error) error {
 }
 
 // printPlan reports the analysis outcome shared by dry-run and auto modes.
-func printPlan(cfg *Config, goMod *parser.GoMod, infos []*finder.ModuleInfo, unanalyzed int) {
+func printPlan(cfg *Config, goMod *parser.GoMod, p plan) {
 	fmt.Printf("[INFO] Module:            %s\n", goMod.Module)
 	fmt.Printf("[INFO] Current Go:        %s\n", goMod.GoVersion)
 	fmt.Printf("[INFO] Target Go:         %s\n", cfg.TargetGoVersion)
 	fmt.Printf("[INFO] Direct deps:       %d\n", parser.CountDirectDeps(goMod.Requires))
 	fmt.Printf("[INFO] Indirect deps:     %d\n", parser.CountIndirectDeps(goMod.Requires))
 
-	if len(infos) == 0 {
-		if unanalyzed > 0 {
+	if len(p.updates) == 0 {
+		switch {
+		case len(p.failed) > 0:
 			fmt.Printf("\n[INFO] No updates found among the dependencies that could be analyzed.\n")
-			return
+		case len(p.held) > 0:
+			fmt.Printf("\n[INFO] No updates within --max-update %s.\n", cfg.Policy.MaxUpdate)
+		default:
+			fmt.Printf("\n[INFO] All direct dependencies are already at their newest Go %s-compatible version.\n",
+				cfg.TargetGoVersion)
 		}
-		fmt.Printf("\n[INFO] All direct dependencies are already at their newest Go %s-compatible version.\n",
-			cfg.TargetGoVersion)
 		return
 	}
 
-	fmt.Printf("\n[INFO] %d module(s) with a different compatible version:\n", len(infos))
-	for _, info := range infos {
+	fmt.Printf("\n[INFO] %d module(s) with a different compatible version:\n", len(p.updates))
+	for _, info := range p.updates {
 		arrow := "→"
 		note := ""
 		if info.Downgrade {
@@ -147,8 +162,22 @@ func printPlan(cfg *Config, goMod *parser.GoMod, infos []*finder.ModuleInfo, una
 		} else if info.BlockedNewer > 0 {
 			note = fmt.Sprintf("  (%d newer version(s) need a later Go)", info.BlockedNewer)
 		}
+		if info.HeldBack > 0 {
+			note += fmt.Sprintf("  (%d more held back by --max-update %s)", info.HeldBack, cfg.Policy.MaxUpdate)
+		}
 		fmt.Printf("  - %s: %s %s %s (%s)%s\n",
 			info.Path, info.CurrentVersion, arrow, info.LatestCompatible, info.UpdateType, note)
+	}
+}
+
+// printHeld lists modules whose only newer versions lie beyond --max-update.
+func printHeld(cfg *Config, held []*finder.ModuleInfo) {
+	if len(held) == 0 {
+		return
+	}
+	fmt.Printf("\n[INFO] %d module(s) have newer versions beyond --max-update %s:\n", len(held), cfg.Policy.MaxUpdate)
+	for _, info := range held {
+		fmt.Printf("  - %s: %s (%d newer)\n", info.Path, info.CurrentVersion, info.HeldBack)
 	}
 }
 
@@ -156,12 +185,13 @@ func printPlan(cfg *Config, goMod *parser.GoMod, infos []*finder.ModuleInfo, una
 func runDryMode(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRoot string) error {
 	fmt.Printf("[INFO] Analyzing dependencies for compatibility with Go %s...\n\n", cfg.TargetGoVersion)
 
-	infos, failed, err := analyze(ctx, cfg, goMod, projectRoot)
+	p, err := analyze(ctx, cfg, goMod, projectRoot)
 	if err != nil {
 		return err
 	}
-	printPlan(cfg, goMod, infos, len(failed))
-	printFailures(failed)
+	printPlan(cfg, goMod, p)
+	printHeld(cfg, p.held)
+	printFailures(p.failed)
 
 	fmt.Println("\n[INFO] Dry run - no changes were made.")
 	return nil
@@ -171,12 +201,14 @@ func runDryMode(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRo
 func runAutoMode(ctx context.Context, cfg *Config, goMod *parser.GoMod, projectRoot string) error {
 	fmt.Printf("[INFO] Auto mode - analyzing dependencies for Go %s...\n\n", cfg.TargetGoVersion)
 
-	infos, failed, err := analyze(ctx, cfg, goMod, projectRoot)
+	p, err := analyze(ctx, cfg, goMod, projectRoot)
 	if err != nil {
 		return err
 	}
-	printPlan(cfg, goMod, infos, len(failed))
-	printFailures(failed)
+	printPlan(cfg, goMod, p)
+	printHeld(cfg, p.held)
+	printFailures(p.failed)
+	infos := p.updates
 
 	// Downgrades are excluded from unattended runs. They are a legitimate
 	// outcome when the pinned version needs a newer toolchain than the target,

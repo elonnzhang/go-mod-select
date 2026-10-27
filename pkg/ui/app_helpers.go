@@ -425,6 +425,7 @@ func (m AppModel) analyzeModules() tea.Cmd {
 			targetGoVersion:  m.targetGoVersion,
 			goMod:            m.goMod,
 			projectRoot:      m.projectRoot,
+			policy:           m.policy,
 		}
 	}
 }
@@ -439,6 +440,7 @@ type startAnalysisMsg struct {
 	// its queries in a sandbox module, but falls back to this when no sandbox
 	// can be created — and either way it must never be the tool's own cwd.
 	projectRoot string
+	policy      finder.Policy
 }
 
 // waitForAnalysisMsg creates a command that waits for the next message from the subscription
@@ -491,6 +493,7 @@ func startAnalysisWorker(msg startAnalysisMsg, sub chan<- tea.Msg, done <-chan s
 	}()
 
 	f := finder.NewWithContext(ctx, msg.projectRoot)
+	f.Policy = msg.policy
 	defer f.Close()
 
 	lookup := func(path, current string) (*finder.ModuleInfo, error) {

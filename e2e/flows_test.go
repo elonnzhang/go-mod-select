@@ -392,3 +392,61 @@ func TestVerifyToggleInTheTUIRollsBackABreakingUpdate(t *testing.T) {
 		t.Errorf("exit code %d", code)
 	}
 }
+
+func TestPrereleasesAreSkippedUnlessAsked(t *testing.T) {
+	p := newFakeProxy(t)
+	p.publish("example.com/dep1",
+		release{version: "v1.0.0", goDir: "1.21"}, release{version: "v1.1.0", goDir: "1.21"},
+		release{version: "v1.2.0-rc1", goDir: "1.21"})
+	sb := newSandbox(t, p, "example.com/dep1")
+
+	out, err := sb.run("--dry-run")
+	if err != nil {
+		t.Fatalf("dry run failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "example.com/dep1: v1.0.0 → v1.1.0") || strings.Contains(out, "rc1") {
+		t.Errorf("by default a release candidate must not be proposed:\n%s", out)
+	}
+
+	out, err = sb.run("--dry-run", "--pre")
+	if err != nil {
+		t.Fatalf("dry run --pre failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "example.com/dep1: v1.0.0 → v1.2.0-rc1 (prerelease)") {
+		t.Errorf("--pre should offer the release candidate:\n%s", out)
+	}
+}
+
+func TestMaxUpdateHoldsBackLargerJumps(t *testing.T) {
+	p := newFakeProxy(t)
+	p.publish("example.com/dep1",
+		release{version: "v1.0.0", goDir: "1.21"}, release{version: "v1.0.5", goDir: "1.21"}, release{version: "v1.3.0", goDir: "1.21"})
+	p.publish("example.com/dep2", release{version: "v1.0.0", goDir: "1.21"}, release{version: "v1.4.0", goDir: "1.21"})
+	sb := newSandbox(t, p, "example.com/dep1", "example.com/dep2")
+
+	out, err := sb.run("--dry-run", "--max-update", "patch")
+	if err != nil {
+		t.Fatalf("dry run failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "example.com/dep1: v1.0.0 → v1.0.5 (patch)") || !strings.Contains(out, "1 more held back by --max-update patch") {
+		t.Errorf("dep1 should take the patch release and say a larger one exists:\n%s", out)
+	}
+	if !strings.Contains(out, "have newer versions beyond --max-update patch") || !strings.Contains(out, "example.com/dep2: v1.0.0 (1 newer)") {
+		t.Errorf("dep2 has nothing within the limit and should be listed as held back:\n%s", out)
+	}
+	if strings.Contains(out, "dep2: v1.0.0 → ") {
+		t.Errorf("dep2 must not be proposed an update:\n%s", out)
+	}
+
+	out, err = sb.run("--dry-run", "--max-update", "minor")
+	if err != nil {
+		t.Fatalf("dry run failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "example.com/dep1: v1.0.0 → v1.3.0") || !strings.Contains(out, "example.com/dep2: v1.0.0 → v1.4.0") {
+		t.Errorf("within a major version both are in reach:\n%s", out)
+	}
+
+	if out, err := sb.run("--dry-run", "--max-update", "huge"); err == nil || !strings.Contains(out, "--max-update") {
+		t.Errorf("a bad level should be rejected, got err=%v\n%s", err, out)
+	}
+}

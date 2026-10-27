@@ -155,14 +155,16 @@ func TestFindCompatibleSkipsReleasesNeedingNewerGo(t *testing.T) {
 	}
 }
 
-// A prerelease newer than @latest was always a candidate; seeding the cache
-// from @latest must not hide it.
+// With prereleases enabled, one newer than @latest is still a candidate; seeding
+// the cache from @latest must not hide it.
 func TestFindCompatibleStillConsidersNewerPrerelease(t *testing.T) {
 	p := newFakeProxy(
 		[]string{"v1.0.0", "v1.1.0", "v1.2.0-rc1"},
 		map[string]string{"v1.0.0": "1.18", "v1.1.0": "1.18", "v1.2.0-rc1": "1.18"})
+	f := p.finder()
+	f.Policy.AllowPrerelease = true
 
-	info, err := p.finder().FindCompatibleVersions(p.module, "v1.0.0", "1.25")
+	info, err := f.FindCompatibleVersions(p.module, "v1.0.0", "1.25")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,8 +226,10 @@ func TestFindCompatibleRefusesDowngradePastUnresolvedRelease(t *testing.T) {
 		[]string{"v1.0.0", "v1.1.0", "v1.2.0", "v1.3.0-rc1"},
 		map[string]string{"v1.0.0": "1.18", "v1.1.0": "1.18", "v1.2.0": "1.26", "v1.3.0-rc1": "1.18"})
 	p.broken["v1.3.0-rc1"] = true
+	f := p.finder()
+	f.Policy.AllowPrerelease = true // the unreadable release is a prerelease, newer than @latest
 
-	_, err := p.finder().FindCompatibleVersions(p.module, "v1.2.0", "1.25")
+	_, err := f.FindCompatibleVersions(p.module, "v1.2.0", "1.25")
 	if err == nil || !strings.Contains(err.Error(), "could not resolve") {
 		t.Fatalf("want a resolution error, got %v", err)
 	}
@@ -270,5 +274,63 @@ func TestFillGoVersionLeavesUnreadableAndDirectivelessAlone(t *testing.T) {
 		if meta.GoVersion != before {
 			t.Errorf("%s: GoVersion changed from %q to %q", name, before, meta.GoVersion)
 		}
+	}
+}
+
+func TestFindCompatiblePrefersTheStableReleaseOverANewerPrerelease(t *testing.T) {
+	p := newFakeProxy(
+		[]string{"v1.0.0", "v1.1.0", "v1.2.0-rc1"},
+		map[string]string{"v1.0.0": "1.18", "v1.1.0": "1.18", "v1.2.0-rc1": "1.18"})
+
+	info, err := p.finder().FindCompatibleVersions(p.module, "v1.0.0", "1.25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LatestCompatible != "v1.1.0" || info.UpdateType == Prerelease {
+		t.Errorf("got %s (%s), want the stable v1.1.0", info.LatestCompatible, info.UpdateType)
+	}
+	for _, spec := range p.requested() {
+		if spec == p.module+"@v1.2.0-rc1" {
+			t.Error("a version the policy excludes should cost no lookup")
+		}
+	}
+	if len(p.calls) != 1 {
+		t.Errorf("the stable latest should be settled by the one combined call, got %d calls", len(p.calls))
+	}
+}
+
+func TestFindCompatibleHonoursMaxUpdate(t *testing.T) {
+	p := newFakeProxy(
+		[]string{"v1.2.0", "v1.2.4", "v1.3.0", "v1.4.0"},
+		map[string]string{"v1.2.0": "1.18", "v1.2.4": "1.18", "v1.3.0": "1.18", "v1.4.0": "1.18"})
+	f := p.finder()
+	f.Policy.MaxUpdate = LimitPatch
+
+	info, err := f.FindCompatibleVersions(p.module, "v1.2.0", "1.25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LatestCompatible != "v1.2.4" || info.UpdateType != Patch {
+		t.Errorf("got %s (%s), want the patch release v1.2.4", info.LatestCompatible, info.UpdateType)
+	}
+	if info.HeldBack != 2 {
+		t.Errorf("HeldBack = %d, want 2 (v1.3.0, v1.4.0)", info.HeldBack)
+	}
+}
+
+// When everything newer is beyond the limit, staying put is the answer, not an
+// error: the module is simply not updatable under the chosen policy.
+func TestFindCompatibleWithNothingWithinTheLimitStaysPut(t *testing.T) {
+	p := newFakeProxy([]string{"v1.3.0", "v1.4.0"}, map[string]string{"v1.3.0": "1.18", "v1.4.0": "1.18"})
+	f := p.finder()
+	f.Policy.MaxUpdate = LimitPatch
+
+	// Pinned to a pseudo-version: no published version shares its major.minor.
+	info, err := f.FindCompatibleVersions(p.module, "v1.2.1-0.20250101000000-abcdefabcdef", "1.25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.LatestCompatible != info.CurrentVersion || info.HeldBack != 2 {
+		t.Errorf("got %+v, want the current version kept and 2 held back", info)
 	}
 }

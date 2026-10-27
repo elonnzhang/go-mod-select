@@ -14,6 +14,7 @@ type keyMap struct {
 	Filter    key.Binding
 	SelectAll key.Binding
 	Verify    key.Binding
+	Safe      key.Binding
 	Esc       key.Binding
 	Quit      key.Binding
 	ForceQuit key.Binding
@@ -61,6 +62,10 @@ var keys = keyMap{
 	SelectAll: key.NewBinding(
 		key.WithKeys("a"),
 		key.WithHelp("a", "select all"),
+	),
+	Safe: key.NewBinding(
+		key.WithKeys("s"),
+		key.WithHelp("s", "select patch/minor"),
 	),
 	Verify: key.NewBinding(
 		key.WithKeys("v"),

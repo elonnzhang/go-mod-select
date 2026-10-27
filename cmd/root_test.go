@@ -112,3 +112,15 @@ func TestResolveGoModPathModes(t *testing.T) {
 		}
 	})
 }
+
+func TestMaxUpdateIsValidatedBeforeAnythingRuns(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // run() opens the log file under $HOME
+	t.Cleanup(func() { rootCmd.SetArgs(nil); maxUpdate = "major" })
+
+	rootCmd.SetArgs([]string{"1.25", "--dir", t.TempDir(), "--max-update", "huge"})
+	err := rootCmd.Execute()
+
+	if err == nil || !strings.Contains(err.Error(), "--max-update") {
+		t.Errorf("an unknown level should be rejected by name, got %v", err)
+	}
+}

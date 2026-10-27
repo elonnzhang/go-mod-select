@@ -72,6 +72,9 @@ type ModuleInfo struct {
 	// BlockedNewer: conflating the two turns a network problem into a false
 	// "your pinned version needs a newer Go" claim.
 	UnresolvedNewer int
+	// HeldBack counts newer releases beyond the --max-update limit. They were not
+	// examined, so some of them may not build with the target Go either.
+	HeldBack int
 }
 
 // ModuleMetadata represents the JSON output from go list -m -json
@@ -112,6 +115,9 @@ type Finder struct {
 	// ctx cancels in-flight subprocesses. Without it, quitting mid-analysis
 	// orphans a dozen `go list` processes still talking to the module proxy.
 	ctx context.Context
+
+	// Policy narrows which published versions may be proposed.
+	Policy Policy
 
 	// runList replaces the `go list -m` subprocess; tests use it to count and
 	// script calls without a network.
@@ -389,12 +395,21 @@ func (f *Finder) FindCompatibleVersions(modulePath, currentVersion, targetGoVers
 		return nil, fmt.Errorf("no published versions for %s", modulePath)
 	}
 
-	// go list -versions documents ascending order; sorting makes the
-	// newest-first walk below correct regardless.
-	candidates := make([]string, len(allVersions))
-	copy(candidates, allVersions)
-	semver.Sort(candidates)
-	reverse(candidates)
+	// go list -versions documents ascending order; selectCandidates sorts anyway
+	// so the newest-first walk below is correct regardless, and drops what the
+	// update policy rules out before anything is fetched for it.
+	candidates, heldBack := f.selectCandidates(allVersions, currentVersion)
+	if len(candidates) == 0 && currentVersion != "" {
+		// Everything published is beyond the limit (typical for a pseudo-version
+		// pin under --max-update patch): staying put is the answer.
+		return &ModuleInfo{
+			Path:             modulePath,
+			CurrentVersion:   currentVersion,
+			LatestCompatible: currentVersion,
+			UpdateType:       Patch,
+			HeldBack:         heldBack,
+		}, nil
+	}
 
 	metas := make(map[string]*ModuleMetadata, len(candidates))
 	if latest != nil {
@@ -452,6 +467,7 @@ func (f *Finder) FindCompatibleVersions(modulePath, currentVersion, targetGoVers
 			Downgrade:        isDowngrade,
 			BlockedNewer:     blockedNewer,
 			UnresolvedNewer:  unresolvedNewer,
+			HeldBack:         heldBack,
 		}
 
 		logger.Log.Info("found compatible version",
@@ -480,13 +496,11 @@ func (f *Finder) FindCompatibleVersions(modulePath, currentVersion, targetGoVers
 		"module", modulePath,
 		"target_go", targetGoVersion,
 		"total_versions", len(allVersions))
-	return nil, fmt.Errorf("no version of %s is compatible with Go %s", modulePath, targetGoVersion)
-}
-
-func reverse(s []string) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
+	if f.Policy.MaxUpdate != LimitMajor {
+		return nil, fmt.Errorf("no version of %s within --max-update %s is compatible with Go %s",
+			modulePath, f.Policy.MaxUpdate, targetGoVersion)
 	}
+	return nil, fmt.Errorf("no version of %s is compatible with Go %s", modulePath, targetGoVersion)
 }
 
 // DetermineUpdateType determines the type of update (patch, minor, major, prerelease)
